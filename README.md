@@ -180,10 +180,11 @@ Do not commit real production addresses or secret keys into docs or scripts.
 
 | Doc | Topic |
 |-----|-------|
-| `DESIGN.md` | Architecture baseline (STELLO-29) |
 | `docs/booking-contract-interface.md` | Booking provider ABI / trust boundary |
 | `docs/sbt-contract-interface.md` | Non-transferability interface evidence |
 | `docs/duplicate-issuance-prevention.md` | Duplicate mint prevention |
 | `docs/credential-and-eligibility-queries.md` | Query / eligibility reads |
 | `docs/events-and-errors.md` | Events and errors |
 | `docs/regression-security-test-suite.md` | Consolidated regression suite |
+
+`DESIGN.md` and `AGENTS.md` are kept local (gitignored) and are not part of the published repo.
