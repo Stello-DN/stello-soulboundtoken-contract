@@ -342,6 +342,7 @@ Define SbtError with contracterror and repr(u32). Preserve these numeric codes:
 | 10 | CredentialNotFound | Requested credential ID was never allocated |
 | 11 | StorageInvariantViolation | Broken linked records, malformed state or missing initialized counter |
 | 12 | CredentialIdOverflow | Checked counter increment fails |
+| 13 | AlreadyInitialized | Defensive rejection of repeated initialization |
 
 No custom Unauthorized error: require_auth fails at the host authorization
 layer. Uncatchable host/resource/archival errors remain host failures, not
