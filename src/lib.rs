@@ -987,6 +987,24 @@ mod tests {
     }
 
     #[test]
+    fn mint_and_config_fail_closed_without_initialization() {
+        let env = test_env();
+        let (client, _, _) = setup(&env, eligible(&env, 1));
+        env.as_contract(&client.address, || {
+            env.storage().instance().remove(&DataKey::Config)
+        });
+        assert_eq!(client.try_get_config(), Err(Ok(Error::NotInitialized)));
+        assert_eq!(
+            client.mock_all_auths().try_mint_for_booking(&1),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert!(env.events().all().events().is_empty());
+        env.as_contract(&client.address, || {
+            assert!(!env.storage().persistent().has(&DataKey::Credential(1)));
+        });
+    }
+
+    #[test]
     fn counter_overflow_and_occupied_slot_do_not_partially_mint() {
         for occupied in [false, true] {
             let env = test_env();
