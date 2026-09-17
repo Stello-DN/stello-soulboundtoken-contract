@@ -1,3 +1,4 @@
 /target
 # Internal product documents
 docs/Stello_SBT_BA_Specification_v*.md
+/test_snapshots/
