@@ -42,6 +42,8 @@ jobs:
       # Deployer / fee payer for first deployment.
       # Do not echo, set -x, or write into artifacts / release notes / manifests.
       STELLAR_SOURCE: ${{ secrets.STELLAR_TESTNET_SECRET_KEY }}
+      # Must authorize __constructor (mint_authority.require_auth) and match vars.MINT_AUTHORITY.
+      MINT_AUTHORITY_SOURCE: ${{ secrets.MINT_AUTHORITY_SECRET_KEY }}
 
     steps:
       - name: Checkout tagged commit
@@ -80,7 +82,7 @@ jobs:
           echo "RELEASE_MODE=deploy" >> "${GITHUB_ENV}"
           echo "Mode: DEPLOY (STELLO_TESTNET_CONTRACT_ID unset)"
 
-      - name: Require environment variables and deploy secret
+      - name: Require environment variables and deploy secrets
         run: |
           set -euo pipefail
           missing=0
@@ -91,7 +93,11 @@ jobs:
             fi
           done
           if [[ -z "${STELLAR_SOURCE:-}" ]]; then
-            echo "::error::Missing secret STELLAR_TESTNET_SECRET_KEY (required for first deploy)"
+            echo "::error::Missing secret STELLAR_TESTNET_SECRET_KEY (required for first deploy fee payer)"
+            missing=1
+          fi
+          if [[ -z "${MINT_AUTHORITY_SOURCE:-}" ]]; then
+            echo "::error::Missing secret MINT_AUTHORITY_SECRET_KEY (required: __constructor calls mint_authority.require_auth())"
             missing=1
           fi
           if [[ "${missing}" -ne 0 ]]; then
@@ -111,6 +117,32 @@ jobs:
 
       - name: Setup toolchain
         uses: ./.github/actions/setup-contract-ci
+
+      - name: Prepare mint-authority identity (must match MINT_AUTHORITY)
+        run: |
+          set -euo pipefail
+          STELLAR_CI_CONFIG="$(mktemp -d)"
+          chmod 700 "${STELLAR_CI_CONFIG}"
+          mkdir -p "${STELLAR_CI_CONFIG}/identity"
+          umask 077
+          printf 'secret_key = "%s"\n' "${MINT_AUTHORITY_SOURCE}" > "${STELLAR_CI_CONFIG}/identity/mint-authority.toml"
+          chmod 600 "${STELLAR_CI_CONFIG}/identity/mint-authority.toml"
+          DERIVED_ADDR="$(
+            stellar keys public-key mint-authority --config-dir "${STELLAR_CI_CONFIG}" \
+              | tr -d '[:space:]'
+          )"
+          if [[ -z "${DERIVED_ADDR}" || ! "${DERIVED_ADDR}" =~ ^G[A-Z0-9]{55}$ ]]; then
+            echo "::error::Could not derive address from MINT_AUTHORITY_SECRET_KEY"
+            rm -rf "${STELLAR_CI_CONFIG}"
+            exit 1
+          fi
+          if [[ "${DERIVED_ADDR}" != "${MINT_AUTHORITY}" ]]; then
+            echo "::error::MINT_AUTHORITY_SECRET_KEY derives to ${DERIVED_ADDR}, but Environment MINT_AUTHORITY is ${MINT_AUTHORITY}. Refusing deploy."
+            rm -rf "${STELLAR_CI_CONFIG}"
+            exit 1
+          fi
+          echo "STELLAR_CI_CONFIG=${STELLAR_CI_CONFIG}" >> "${GITHUB_ENV}"
+          echo "Verified mint-authority identity == MINT_AUTHORITY (${DERIVED_ADDR})"
 
       - name: CI checks (must pass before release)
         run: |
@@ -236,12 +268,22 @@ jobs:
         id: deploy
         run: |
           set -euo pipefail
+          if [[ -z "${STELLAR_CI_CONFIG:-}" || ! -d "${STELLAR_CI_CONFIG}" ]]; then
+            echo "::error::STELLAR_CI_CONFIG missing — mint-authority identity was not prepared"
+            exit 1
+          fi
+          # __constructor calls mint_authority.require_auth() inside the create-contract
+          # host fn (non-root). Record + sign that auth entry with mint-authority.
           set +e
           DEPLOY_LOG="$(
             stellar contract deploy \
               --wasm "${WASM_PATH}" \
               --optimize=false \
               --source-account "${STELLAR_SOURCE}" \
+              --sign-with-key mint-authority \
+              --config-dir "${STELLAR_CI_CONFIG}" \
+              --auth-mode non-root \
+              --auto-sign \
               --network "${NETWORK}" \
               -- \
               --booking_contract "${BOOKING_CONTRACT}" \
@@ -585,3 +627,12 @@ jobs:
             echo "| Stellar Build Info | ${BUILD_INFO_STATUS} |"
             echo "| Upgrade | not supported (by design) |"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Cleanup temporary Stellar CLI identity
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${STELLAR_CI_CONFIG:-}" && -d "${STELLAR_CI_CONFIG}" ]]; then
+            rm -rf "${STELLAR_CI_CONFIG}"
+            echo "Removed temporary STELLAR_CI_CONFIG"
+          fi
