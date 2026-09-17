@@ -201,14 +201,20 @@ jobs:
           cp "${WASM_PATH}" artifacts/stello_sbt_contract.wasm
           echo "${FILE_SHA256}  stello_sbt_contract.wasm" > artifacts/SHA256SUMS
 
+      # GitHub Artifact Attestations require a public repo or a paid org plan.
+      # Private repos on unsupported plans fail with "Feature not available".
+      # Do not hard-fail Testnet deploy on that limitation; chain hash checks remain required.
       - name: Attest exact release WASM (GitHub build provenance)
         id: attest
+        continue-on-error: true
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.WASM_PATH }}
           subject-name: stello_sbt_contract.wasm
 
       - name: Verify GitHub attestation for exact WASM
+        id: attest_verify
+        if: ${{ steps.attest.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -216,6 +222,15 @@ jobs:
           command -v gh >/dev/null
           gh attestation verify "${WASM_PATH}" --repo "${{ github.repository }}"
           echo "github_attestation_verification=pass" >> "${GITHUB_ENV}"
+          echo "attestation_status=verified" >> "${GITHUB_ENV}"
+
+      - name: Record attestation status when skipped or unavailable
+        if: ${{ steps.attest.outcome != 'success' }}
+        run: |
+          set -euo pipefail
+          echo "::warning::GitHub Artifact Attestations unavailable for this repository/plan; continuing deploy without attestation. Upgrade org billing or make the repo public to enable SEP-55 Build Verified."
+          echo "github_attestation_verification=skipped" >> "${GITHUB_ENV}"
+          echo "attestation_status=skipped" >> "${GITHUB_ENV}"
 
       - name: Deploy exact WASM to Stellar Testnet (--optimize=false)
         id: deploy
@@ -495,10 +510,15 @@ jobs:
           CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
           WASM_SHA256="${{ steps.sha.outputs.wasm_sha256 }}"
           VERSION="${EXPECTED_VERSION:-}"
-          ATTEST_LINE="Build provenance: GitHub Attestation generated"
-          if [[ -n "${ATTESTATION_URL:-}" ]]; then
-            ATTEST_LINE="${ATTEST_LINE}
+          ATTEST_STATUS="${attestation_status:-skipped}"
+          if [[ "${ATTEST_STATUS}" == "verified" ]]; then
+            ATTEST_LINE="Build provenance: GitHub Attestation verified"
+            if [[ -n "${ATTESTATION_URL:-}" ]]; then
+              ATTEST_LINE="${ATTEST_LINE}
           Attestation URL: ${ATTESTATION_URL}"
+            fi
+          else
+            ATTEST_LINE="Build provenance: skipped (GitHub Artifact Attestations unavailable for this org/plan)"
           fi
 
           NOTES="$(cat <<EOF
@@ -560,8 +580,8 @@ jobs:
             echo "| Configure next | Set \`STELLO_TESTNET_CONTRACT_ID\` to this Contract ID |"
             echo "| Interface verification | PASS |"
             echo "| Hash verification | PASS |"
-            echo "| Build Attestation | pass |"
-            echo "| GitHub Attestation Verification | pass |"
+            echo "| Build Attestation | ${attestation_status:-skipped} |"
+            echo "| GitHub Attestation Verification | ${github_attestation_verification:-skipped} |"
             echo "| Stellar Build Info | ${BUILD_INFO_STATUS} |"
             echo "| Upgrade | not supported (by design) |"
           } >> "${GITHUB_STEP_SUMMARY}"
