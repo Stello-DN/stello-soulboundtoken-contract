@@ -9,19 +9,21 @@ are recorded below. Release evidence remains subject to section 17.
 Issue: [STELLO-29](https://stellodn.atlassian.net/browse/STELLO-29),
 parent [STELLO-12](https://stellodn.atlassian.net/browse/STELLO-12).
 Their descriptions, acceptance criteria, status and comments were read through
-Atlassian MCP. Both are To Do and have no comments. The Epic calls for a
+Atlassian MCP. Workflow status and comments are maintained in Jira and are not
+hard-coded here. The Epic calls for a
 non-transferable credential linked to completed bookings for review authorization;
 it has no separate acceptance-criteria list. STELLO-29 assigns cross-contract
 integration, final deployment and evidence to STELLO-13.
 
 Other inputs: AGENTS.md, docs/booking-contract-interface.md v0.2, and the locally
-available Stello_SBT_BA_Specification_v0.1.md (STELLO-BA-SBT-001, Draft).
-The task owner's approval resolves the older BA's dispute question: any prior
-dispute permanently excludes a booking. Constructor initialization, idempotent
-success, the storage schema and TTL baseline are also explicitly approved.
-These decisions supersede the older draft proposals for this implementation;
-they do not label the entire BA approved. No unresolved source conflict is
-silently resolved by this document.
+available Stello_SBT_BA_Specification_v0.1.md (STELLO-BA-SBT-001, Draft). The
+older BA specification's eligibility summary and AGENTS.md's older eligibility
+summary (which omitted `was_disputed`) are superseded for this design by the
+verified Booking Contract interface and the approved STELLO-29 baseline: any
+prior dispute permanently excludes a booking. Constructor initialization,
+idempotent success, the storage schema and TTL baseline are also explicitly
+approved. These decisions supersede those older eligibility summaries without
+silently resolving unrelated source conflicts or labeling the entire BA approved.
 
 Scope: one immutable Proof-of-Experience credential for the recorded traveller
 of each eligible booking; authenticated issuance, durable uniqueness, reads,
@@ -79,6 +81,15 @@ input and reject a hash mismatch before compiling the consumer.
 Successful lookup establishes existence. Provider BookingNotFound is error code
 5. Other invocation/decode errors cannot be interpreted as an absent booking.
 No supplementary Booking method or write operation is needed.
+
+`booking_id` is the canonical lookup key supplied to
+`get_booking(booking_id)`. The returned Booking also contains `booking_ref`, a
+stable business/reference value. The SBT persists the canonical
+`BookingKey { booking_contract, booking_id }` inside each Credential and in the
+Issuance uniqueness index; it does not copy provider fields into that key. The
+`booking_ref` remains provider-owned and is available through the returned
+Booking for application display or evidence, but it is not an alternative SBT
+lookup key or a second uniqueness namespace. No new Booking method is implied.
 
 Use no_std and the same resolved soroban-sdk and Rust toolchain as the pinned
 provider build. Its manifest declares soroban-sdk "27.0.1", a version requirement,
@@ -352,6 +363,33 @@ baseline has no revocation and does not consume credentials when used.
 The review service independently authenticates wallet control and applies a
 database uniqueness constraint for one review per booking/traveller. Passing an
 Address does not prove control. A credential for another booking does not qualify.
+
+### Privacy and consent
+
+Minting creates a permanent public link between the traveller wallet, the
+configured Booking Contract and a booking identifier. Before the mint request is
+submitted, the application must obtain explicit, informed traveller consent for
+that public Proof-of-Experience credential and its booking linkage. The SBT
+cannot enforce an off-chain consent screen, so the backend must record the
+consent decision and avoid submitting a mint without it; that operational record
+is not an authority to bypass on-chain eligibility.
+
+On-chain data is minimized to the Credential schema and required event fields.
+Do not write names, email addresses, precise location, chat, review text,
+payment details, raw commercial terms or other PII to SBT storage or events.
+The application must disclose that the credential is public, non-transferable,
+booking-specific and may reveal experience history to anyone who can inspect the
+ledger. External presentation metadata, if later approved, must preserve the
+same minimization and integrity rules.
+
+The MVP has no burn, revocation, owner migration or consent-withdrawal method.
+If a traveller withdraws consent after issuance, the application must stop new
+uses or presentation of the credential where policy permits, while preserving
+the immutable on-chain record; it cannot erase the public linkage. The exact
+withdrawal, suppression, support and legal-retention policy remains unresolved
+for production and requires Product Owner and privacy approval. No off-chain
+flag may be treated as an on-chain revocation or alter `is_review_eligible` in
+this baseline.
 
 ## 15. Trust boundaries and upgrades
 
