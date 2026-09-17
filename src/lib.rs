@@ -1059,4 +1059,150 @@ mod tests {
             assert_eq!(load_next_id(&env), Ok(2));
         });
     }
+    #[test]
+    fn transfer_and_approval_calls_cannot_reassign_owner_even_with_auth() {
+        let env = test_env();
+        let record = eligible(&env, 1);
+        let owner = record.traveller.clone();
+        let recipient = Address::generate(&env);
+        let (client, _, _) = setup(&env, record);
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let original = client.get_credential(&id);
+        // Grant every requested authorization: absence of an ownership-changing
+        // entrypoint must protect the credential even from its owner/authority.
+        env.mock_all_auths();
+        for (name, args) in [
+            (
+                "transfer",
+                vec![
+                    &env,
+                    owner.clone().into_val(&env),
+                    recipient.clone().into_val(&env),
+                    id.into_val(&env),
+                ],
+            ),
+            (
+                "transfer_from",
+                vec![
+                    &env,
+                    recipient.clone().into_val(&env),
+                    owner.clone().into_val(&env),
+                    recipient.clone().into_val(&env),
+                    id.into_val(&env),
+                ],
+            ),
+            (
+                "approve",
+                vec![
+                    &env,
+                    owner.clone().into_val(&env),
+                    recipient.clone().into_val(&env),
+                    id.into_val(&env),
+                    100_u32.into_val(&env),
+                ],
+            ),
+            (
+                "set_owner",
+                vec![&env, id.into_val(&env), recipient.clone().into_val(&env)],
+            ),
+            (
+                "burn",
+                vec![&env, owner.clone().into_val(&env), id.into_val(&env)],
+            ),
+        ] {
+            let result = env.try_invoke_contract::<soroban_sdk::Val, Error>(
+                &client.address,
+                &Symbol::new(&env, name),
+                args,
+            );
+            assert!(result.is_err(), "unexpected callable method: {name}");
+            assert!(env.events().all().events().is_empty());
+            assert_eq!(client.get_credential(&id), original);
+            assert_eq!(client.get_credential_by_booking(&1), Some(original.clone()));
+            assert!(client.is_review_eligible(&1, &owner));
+            assert!(!client.is_review_eligible(&1, &recipient));
+        }
+    }
+
+    #[test]
+    fn changed_provider_traveller_and_unauthorized_retry_cannot_replace_owner() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let mut record = eligible(&env, 1);
+        let owner = record.traveller.clone();
+        let replacement = Address::generate(&env);
+        let (client, provider, _) = setup(&env, record.clone());
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let original = client.get_credential(&id);
+        record.traveller = replacement.clone();
+        env.as_contract(&provider, || {
+            env.storage().instance().set(&MockKey::Booking, &record)
+        });
+        // Neither the original recipient nor an unrelated wallet is the mint authority.
+        for signer in [&owner, &replacement] {
+            assert!(
+                client
+                    .mock_auths(&[MockAuth {
+                        address: signer,
+                        invoke: &MockAuthInvoke {
+                            contract: &client.address,
+                            fn_name: "mint_for_booking",
+                            args: (1_u64,).into_val(&env),
+                            sub_invokes: &[],
+                        },
+                    }])
+                    .try_mint_for_booking(&1)
+                    .is_err()
+            );
+            assert!(env.events().all().events().is_empty());
+            assert_eq!(client.get_credential(&id), original);
+        }
+        assert_eq!(client.mock_all_auths().mint_for_booking(&1), id);
+        assert!(env.events().all().events().is_empty());
+        assert_eq!(client.get_credential(&id), original);
+        assert_eq!(client.get_credential_by_booking(&1), Some(original));
+        assert!(client.is_review_eligible(&1, &owner));
+        assert!(!client.is_review_eligible(&1, &replacement));
+        env.as_contract(&client.address, || assert_eq!(load_next_id(&env), Ok(2)));
+    }
+
+    #[contract]
+    struct StorageAttacker;
+
+    #[contractimpl]
+    impl StorageAttacker {
+        pub fn forge(env: Env, credential: Credential) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Credential(credential.credential_id), &credential);
+            env.storage().persistent().set(
+                &DataKey::Issuance(credential.booking),
+                &credential.credential_id,
+            );
+        }
+    }
+
+    #[test]
+    fn another_contract_cannot_overwrite_sbt_storage_with_identical_keys() {
+        let env = test_env();
+        let (client, _, _) = setup(&env, eligible(&env, 1));
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let original = client.get_credential(&id);
+        let mut forged = original.clone();
+        forged.owner = Address::generate(&env);
+        let attacker = env.register(StorageAttacker, ());
+        StorageAttackerClient::new(&env, &attacker).forge(&forged);
+        env.as_contract(&attacker, || {
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, Credential>(&DataKey::Credential(id)),
+                Some(forged.clone())
+            );
+        });
+        assert_eq!(client.get_credential(&id), original);
+        assert_eq!(client.get_credential_by_booking(&1), Some(original.clone()));
+        assert!(client.is_review_eligible(&1, &original.owner));
+        assert!(!client.is_review_eligible(&1, &forged.owner));
+    }
 }
