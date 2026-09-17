@@ -2,56 +2,66 @@
 
 | Field | Value |
 |---|---|
-| Document | SBT dependency interface |
-| Version | 0.1 |
+| Document | Booking Contract dependency interface |
+| Version | 0.2 |
 | Date | 17 September 2026 |
-| Consumer | StelloSbtEngine |
-| Provider | StelloBookingContract |
-| Status | Reported baseline — verify against current source/WASM before implementation |
+| Consumer | `StelloSbtEngine` |
+| Provider | `StelloBookingContract` |
+| Provider version | `0.1.1` |
+| Network | Stellar Testnet |
+| Verification status | Verified from compiled WASM interface |
+| WASM SHA-256 | `90f7e80462bdd6ca9b18f3b2b02c31a7ee467e47b4fb9b996874ccf50ffcd86f` |
+| Booking Contract ID | Record before SBT deployment |
+| Provider commit SHA | Record before SBT deployment |
 
 ## 1. Purpose
 
-Define the minimum Booking Contract interface required by `StelloSbtEngine` to validate a booking before issuing a Proof-of-Experience credential.
+This document defines the Booking Contract interface and trust boundary consumed by `StelloSbtEngine` when issuing a Proof-of-Experience credential.
 
-This file is not an authoritative ABI dump. The authoritative integration input is the contract specification embedded in the exact Booking Contract WASM artifact used for deployment. Never manually recreate provider types when a generated Soroban client can be used.
+The authoritative integration input is the specification embedded in the exact Booking Contract WASM artifact. Generate the SBT provider client and types from the pinned WASM; do not manually reproduce them.
 
 ## 2. Ownership boundary
 
 | Concern | Authoritative owner |
 |---|---|
-| Booking state, traveler, host, escrow and settlement | Booking Contract |
-| Credential issuance, owner and duplicate-mint index | SBT Contract |
-| Mint job, retry and transaction hash | Backend |
-| Review content and one-review constraint | Review service |
+| Booking identity, state, traveler, cancellation, dispute and settlement | Booking Contract |
+| Credential, owner and booking-to-credential issuance index | SBT Contract |
+| Mint job, retry policy and transaction tracking | Backend |
+| Review content and review-submission policy | Review service |
 
-Booking Contract does not store `sbt_minted`. SBT Contract must check its own issuance index.
+Booking Contract does not store an `sbt_minted` flag. Duplicate prevention belongs to the SBT Contract's authoritative issuance index.
 
-## 3. Reported public interface
+## 3. Verified public interface
 
-The following methods were reported from the deployed Testnet contract interface:
+The v0.1.1 WASM exports:
+
+```text
+__constructor
+book
+cancel_by_host
+cancel_by_traveller
+check_in
+complete
+contract_version
+execute_split
+get_booking
+get_booking_by_ref
+get_booking_id_by_ref
+get_booking_state
+get_cancel_settlement
+get_config
+get_total_escrowed
+lock_escrow
+open_dispute
+resolve_dispute
+update_booking
+upgrade
+```
+
+These methods are not part of the interface and must not be invented:
 
 ```text
 initialize
-get_config
-book
-update_booking
-get_booking
-get_booking_state
-lock_escrow
-check_in
-complete
-execute_split
-cancel_by_traveller
-cancel_by_host
-get_cancel_settlement
-open_dispute
-resolve_dispute
-get_total_escrowed
-```
-
-The following methods are not part of the reported interface and must not be invented:
-
-```text
 get_next_booking_id
 claim_payout
 get_claimable_balance
@@ -59,196 +69,228 @@ mint_sbt
 is_sbt_minted
 ```
 
-## 4. Minimum SBT dependency
-
-SBT should require only one Booking Contract read operation if it exposes all required fields:
-
-```text
-get_booking(booking_id: u64) -> Booking
-```
-
-Before implementation, confirm the exact argument and return schema from the current WASM. The returned booking must expose equivalent data for:
-
-| Required fact | Reported field | SBT validation |
-|---|---|---|
-| Traveler recipient | `traveller` | Credential owner must be derived from this address |
-| Lifecycle state | `state` | Must equal `BookingState::Completed` |
-| Financial finality | `settled` | Must be `true` |
-| Cancellation status | `was_cancelled` | Must be `false` |
-| Booking identity | Booking ID or returned ID/reference | Must match the requested booking |
-
-Reported supporting fields include `escrow_locked`, but SBT eligibility should rely on `settled`, not merely escrow being locked.
-
-### Proposed eligibility predicate
+## 4. Constructor
 
 ```rust
-booking.state == BookingState::Completed
+fn __constructor(
+    env: Env,
+    stello_wallet: Address,
+    token: Address,
+    ops_pool: Address,
+    review_pool: Address,
+    qa_pool: Address,
+    o2o_pool: Address,
+    host_cancel_fee: i128,
+);
+```
+
+The provider uses `__constructor`; it does not expose a separately callable `initialize` method.
+
+## 5. SBT dependency method
+
+```rust
+fn get_booking(
+    env: Env,
+    booking_id: u64,
+) -> Result<Booking, Error>;
+```
+
+An unknown booking returns `Error::BookingNotFound` (code `5`). Dependency failures, archived entries and decode failures must fail closed.
+
+## 6. Verified Booking type
+
+```rust
+#[contracttype]
+pub struct Booking {
+    pub amount: i128,
+    pub booking_id: u64,
+    pub booking_ref: BytesN<32>,
+    pub cancelled_by: CancelledBy,
+    pub checked_in: bool,
+    pub created_at: u64,
+    pub escrow_amount: i128,
+    pub escrow_locked: bool,
+    pub host: Address,
+    pub service_ref: BytesN<32>,
+    pub settled: bool,
+    pub start_time: u64,
+    pub state: BookingState,
+    pub token: Address,
+    pub traveller: Address,
+    pub was_cancelled: bool,
+    pub was_disputed: bool,
+}
+```
+
+Integration rules:
+
+- The field is spelled `traveller`.
+- `was_cancelled` is an irreversible cancellation-history flag.
+- `was_disputed` is an irreversible dispute-history flag.
+- `resolve_dispute()` may return the current state to `Completed`, but preserves `was_disputed == true`.
+- Derive the SBT recipient from `booking.traveller`; the caller cannot override it.
+
+## 7. Verified enums
+
+```rust
+#[contracttype]
+pub enum BookingState {
+    Created = 0,
+    Escrowed = 1,
+    CheckedIn = 2,
+    Completed = 3,
+    Cancelled = 4,
+    Disputed = 5,
+}
+
+#[contracttype]
+pub enum CancelledBy {
+    None = 0,
+    Traveller = 1,
+    Host = 2,
+}
+
+#[contracttype]
+pub enum SettlementType {
+    Completed = 0,
+    TravellerCancel = 1,
+    HostCancel = 2,
+    Dispute = 3,
+}
+```
+
+## 8. Approved SBT eligibility policy
+
+```rust
+booking.booking_id == requested_booking_id
+    && booking.state == BookingState::Completed
     && booking.settled
     && !booking.was_cancelled
+    && !booking.was_disputed
 ```
 
-This predicate is a proposed product baseline. Dispute-resolved completed bookings require a Product Owner decision before final approval.
+| Validation | Required value | Failure behavior |
+|---|---:|---|
+| Booking lookup | Successful | Reject missing/dependency failure |
+| `booking_id` | Requested ID | Reject mismatch |
+| `state` | `Completed` | Reject other states |
+| `settled` | `true` | Reject unsettled booking |
+| `was_cancelled` | `false` | Reject any booking ever cancelled |
+| `was_disputed` | `false` | Reject any booking ever disputed |
 
-## 5. Reported types relevant to SBT
+The policy rejects a dispute-resolved booking even when its current state is `Completed` and `settled == true`.
 
-### BookingState
-
-```text
-Created
-Escrowed
-CheckedIn
-Completed
-Cancelled
-Disputed
-```
-
-### Booking
-
-The reported interface confirms a `Booking` custom type containing lifecycle and financial fields including:
-
-```text
-state
-escrow_locked
-settled
-was_cancelled
-```
-
-It is also expected to contain the traveler address used by Booking Contract operations. Do not treat this abbreviated description as the complete struct definition. Confirm:
-
-- Exact field names and order.
-- Whether the traveler field is spelled `traveller` or `traveler`.
-- Exact numeric type of booking ID.
-- Exact amount and timestamp types.
-- Whether a booking ID is stored inside the value or exists only as the storage key.
-- Soroban SDK/type compatibility between both contracts.
-
-### Other reported types
-
-These are not required to decide basic SBT eligibility but form part of the reported Booking Contract interface:
-
-```text
-Config
-SplitAmounts
-CancelSettlement
-SettlementAmounts
-CancelledBy
-SettlementType
-```
-
-## 6. Integration approach
-
-Use a client generated from the exact Booking Contract WASM specification. Do not duplicate `Booking` and `BookingState` manually in the SBT repository.
-
-Illustrative structure only:
+## 9. Integration approach
 
 ```rust
 mod booking_contract {
-    soroban_sdk::contractimport!(file = "path/to/verified_booking_contract.wasm");
+    soroban_sdk::contractimport!(
+        file = "path/to/pinned/stello_booking_contract.wasm"
+    );
 }
 
-let client = booking_contract::Client::new(&env, &booking_contract_address);
+let client = booking_contract::Client::new(
+    &env,
+    &trusted_booking_contract,
+);
+
 let booking = client.get_booking(&booking_id);
 ```
 
-The actual generated client name and method signature must come from the WASM specification.
+Confirm the generated error behavior through compilation and cross-contract tests. Do not duplicate `Booking`, `BookingState` or provider errors manually in production integration code.
 
-### Artifact rules
+### Required artifact record
 
-- Pin the Booking Contract WASM/spec version consumed by SBT.
-- Record Booking Contract repository, commit SHA and WASM SHA-256.
-- Do not point generation at an untracked local artifact.
-- Rebuild and review generated types whenever the Booking ABI changes.
-- Treat an ABI-breaking Booking change as an SBT integration change requiring regression tests.
+```text
+Provider repository
+Provider release/tag
+Provider commit SHA
+Booking Contract ID and network
+WASM filename
+WASM SHA-256
+Soroban SDK/toolchain version
+```
 
-## 7. Authorization model
+Any Booking ABI change requires client regeneration, integration review and regression tests.
 
-Recommended MVP flow:
+## 10. Authorization and trust boundary
 
-1. Booking settlement succeeds in its own transaction.
-2. Backend mint worker submits `mint_for_booking(booking_id)` to SBT Contract.
-3. SBT Contract authenticates the configured mint authority.
-4. SBT Contract calls the configured trusted Booking Contract.
-5. SBT derives the recipient from the returned booking.
-6. SBT checks its own booking-to-credential index.
-7. SBT stores the credential/index atomically and emits `SBTMinted`.
+1. Booking settlement succeeds independently.
+2. Backend submits `mint_for_booking(booking_id)` using the configured mint authority.
+3. SBT authenticates that authority.
+4. SBT calls the configured trusted Booking Contract.
+5. SBT validates the complete eligibility predicate.
+6. SBT derives the owner from `booking.traveller`.
+7. SBT checks its own issuance index.
+8. SBT atomically stores the credential and index, then emits `SBTMinted`.
 
-Backend must not submit eligibility booleans or choose the credential recipient.
+The caller must not supply an alternative Booking Contract address, recipient, eligibility flag or Booking state.
 
-The SBT configuration must contain one trusted Booking Contract address. A mint caller must not be able to provide an arbitrary Booking Contract address.
+Booking Contract exposes an authenticated `upgrade` operation. Pinning its address therefore does not freeze provider behavior; Booking's configured `stello_wallet` remains part of the SBT trust boundary.
 
-## 8. Failure handling
+## 11. Failure handling
 
 | Condition | Required behavior |
 |---|---|
-| Booking does not exist | Reject mint; no SBT storage mutation |
-| Booking Contract invocation fails | Reject/fail closed; backend may reconcile and retry |
-| State is not Completed | Reject as ineligible |
-| `settled == false` | Reject as ineligible |
-| `was_cancelled == true` | Reject as ineligible |
-| Booking already has credential | Return existing ID or typed `AlreadyMinted` according to approved API; never issue twice |
-| Booking storage is archived | Restore provider data or fail closed; do not interpret as missing/new |
-| SBT issuance fails after settlement | Booking settlement remains successful; retry only SBT issuance |
-| Transaction result is unknown | Query confirmed SBT state before submitting another transaction |
+| Booking not found | Reject; do not mutate SBT storage |
+| Provider invocation/decode failure | Fail closed |
+| Booking ID mismatch | Reject |
+| State is not `Completed` | Reject |
+| `settled == false` | Reject |
+| `was_cancelled == true` | Reject |
+| `was_disputed == true` | Reject |
+| Credential already exists | Return existing ID; do not emit another mint event |
+| Provider data is archived | Restore or fail; never treat archive as absence |
+| Mint fails after settlement | Preserve Booking settlement; retry SBT issuance only |
+| Submission result is unknown | Query authoritative SBT state before resubmitting |
 
-## 9. Required verification commands
+## 12. Required integration tests
 
-Run against the exact build/deployment artifact:
-
-```bash
-stellar contract info interface \
-  --wasm <PATH_TO_BOOKING_WASM>
-```
-
-For a deployed Testnet contract:
-
-```bash
-stellar contract info interface \
-  --id "$BOOKING_CONTRACT_ID" \
-  --network testnet
-```
-
-Save the output as a release artifact or CI evidence. Confirm at minimum:
-
-- `get_booking` exists.
-- Its booking ID type.
-- Complete `Booking` struct.
-- Exact `BookingState` representation.
-- Traveler field spelling/type.
-- `settled` and `was_cancelled` are returned.
-- The artifact hash matches the intended deployed code.
-
-Do not commit addresses, keys or environment-specific secrets into contract source.
-
-## 10. Contract-level integration tests
-
-1. Eligible Completed + settled + not-cancelled booking mints to its recorded traveler.
+1. Completed, settled, never-cancelled and never-disputed booking mints.
 2. Created, Escrowed, CheckedIn, Cancelled and Disputed bookings do not mint.
 3. Completed but unsettled booking does not mint.
-4. Cancelled flag prevents mint even if inconsistent state is presented in a mock.
-5. Caller cannot override traveler.
-6. Caller cannot replace trusted Booking Contract.
-7. Unknown booking and provider invocation failure leave no partial SBT state.
-8. Repeated/concurrent request produces at most one credential.
-9. Different eligible bookings for the same traveler can produce separate credentials.
-10. A deployment/spec mismatch is detected before production deployment.
+4. `was_cancelled == true` prevents mint regardless of current state.
+5. `was_disputed == true` prevents mint after dispute resolution.
+6. Caller cannot override `booking.traveller`.
+7. Caller cannot replace the trusted Booking Contract.
+8. Unknown booking/provider failure leaves no partial SBT state.
+9. Repeated/concurrent requests create at most one credential.
+10. Different eligible bookings for one traveler can create distinct credentials.
+11. Real cross-contract tests use the pinned Booking v0.1.1 WASM.
+12. CI detects a provider hash or ABI mismatch.
 
-Mock-based tests are useful for SBT unit coverage, but Epic 3 must demonstrate actual cross-contract invocation using the compiled Booking Contract WASM.
+## 13. Verification baseline
 
-## 11. Open items before coding mint
+```bash
+cargo fmt --all -- --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+stellar contract build
+stellar contract info interface \
+  --wasm target/wasm32v1-none/release/stello_booking_contract.wasm
+```
 
-- Verify the complete current Booking struct from source/WASM.
-- Confirm Booking Contract artifact path, version, commit and hash.
-- Confirm the exact `get_booking` behavior for a missing/archived booking.
-- Confirm the Soroban SDK/toolchain versions used by both repositories.
-- Decide whether dispute-resolved Completed bookings qualify for SBT.
-- Decide idempotent result: return existing credential ID or `AlreadyMinted`.
-- Approve persistent TTL and restoration policy for both Credential and issuance index.
+Recorded result:
 
-If any required eligibility field is absent, stop. Propose the smallest read-only Booking Contract interface change, document compatibility impact and implement it under a separate approved Jira ticket.
+```text
+Provider version: 0.1.1
+Tests: 138 passed; 0 failed
+Optimized WASM size: 31,217 bytes
+Exported functions: 20
+WASM SHA-256: 90f7e80462bdd6ca9b18f3b2b02c31a7ee467e47b4fb9b996874ccf50ffcd86f
+```
 
-## 12. Source baseline
+Before deploying SBT, add the deployed Booking Contract ID, deployment transaction/ledger and provider commit SHA.
 
-- Reported StelloBookingContract Testnet interface from project deployment discussions.
-- `Stello_SBT_BA_Specification_v0.1.md`.
-- `Stello_Booking_Contract_BA_Specification_v0.1.md`.
-- Actual Booking Contract source, generated specification and deployed WASM must supersede this reported summary when inspected.
+## 14. Change control
+
+If the provider ABI changes:
+
+1. Stop the SBT release.
+2. Pin and inspect the new Booking WASM.
+3. Regenerate the imported client.
+4. Review `Booking`, `BookingState`, `get_booking` and error changes.
+5. Re-run cross-contract eligibility and idempotency tests.
+6. Update this document and release evidence.
+
+Do not infer compatibility from a matching method name alone.
