@@ -1,3 +1,11 @@
 /target
-# Internal product documents
+# Internal product documents (local-only; do not publish)
 docs/Stello_SBT_BA_Specification_v*.md
+/DESIGN.md
+/AGENTS.md
+/test_snapshots/
+
+# Generated provenance (e.g. deployment/testnet.json) is produced by the
+# Deploy Testnet workflow, uploaded as a GitHub Actions artifact and Release
+# asset, and is NOT required in git.
+/deployment/

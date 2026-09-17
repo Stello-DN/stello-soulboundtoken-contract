@@ -1,0 +1,656 @@
+# Testnet release for annotated tags: v*-testnet.*
+# SBT has no on-chain upgrade() entrypoint (immutable credential registry).
+# This workflow only performs FIRST DEPLOY when STELLO_TESTNET_CONTRACT_ID is
+# unset. If the variable is set, the job refuses to redeploy a second registry.
+# Never deploys from pull_request or ordinary branch pushes.
+# Never uses pull_request_target.
+name: Deploy Testnet
+
+"on":
+  push:
+    tags:
+      - "v*-testnet.*"
+
+# Serialize all Testnet contract mutations. Never cancel an in-flight job that
+# may already be submitting an on-chain transaction.
+concurrency:
+  group: stello-sbt-testnet-contract
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  WASM_PATH: target/wasm32v1-none/release/stello_sbt_contract.wasm
+  NETWORK: testnet
+
+jobs:
+  deploy:
+    name: Build and deploy (Testnet)
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    env:
+      BOOKING_CONTRACT: ${{ vars.BOOKING_CONTRACT }}
+      MINT_AUTHORITY: ${{ vars.MINT_AUTHORITY }}
+      STELLO_TESTNET_CONTRACT_ID: ${{ vars.STELLO_TESTNET_CONTRACT_ID }}
+      # Deployer / fee payer for first deployment.
+      # Do not echo, set -x, or write into artifacts / release notes / manifests.
+      STELLAR_SOURCE: ${{ secrets.STELLAR_TESTNET_SECRET_KEY }}
+      # Must authorize __constructor (mint_authority.require_auth) and match vars.MINT_AUTHORITY.
+      MINT_AUTHORITY_SOURCE: ${{ secrets.MINT_AUTHORITY_SECRET_KEY }}
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Guard — tag-only release
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "::error::Release job must only run for tags"
+            exit 1
+          fi
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v.*-testnet\..*$ ]]; then
+            echo "::error::Unexpected tag pattern: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Guard — first deploy only (SBT has no upgrade path)
+        id: mode
+        run: |
+          set -euo pipefail
+          if [[ -n "${STELLO_TESTNET_CONTRACT_ID:-}" ]]; then
+            RAW_CID="${STELLO_TESTNET_CONTRACT_ID}"
+            CID="$(printf '%s' "${RAW_CID}" | tr -d '[:space:]')"
+            if [[ -z "${CID}" ]]; then
+              echo "::error::STELLO_TESTNET_CONTRACT_ID is whitespace-only. Unset it for first deploy."
+              exit 1
+            fi
+            echo "::error::STELLO_TESTNET_CONTRACT_ID is already set (${CID}). stello_sbt_contract has no upgrade() entrypoint; refusing automatic redeploy of a second credential registry."
+            exit 1
+          fi
+          echo "release_mode=deploy" >> "${GITHUB_OUTPUT}"
+          echo "RELEASE_MODE=deploy" >> "${GITHUB_ENV}"
+          echo "Mode: DEPLOY (STELLO_TESTNET_CONTRACT_ID unset)"
+
+      - name: Require environment variables and deploy secrets
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in BOOKING_CONTRACT MINT_AUTHORITY; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Environment variable: ${name}"
+              missing=1
+            fi
+          done
+          if [[ -z "${STELLAR_SOURCE:-}" ]]; then
+            echo "::error::Missing secret STELLAR_TESTNET_SECRET_KEY (required for first deploy fee payer)"
+            missing=1
+          fi
+          if [[ -z "${MINT_AUTHORITY_SOURCE:-}" ]]; then
+            echo "::error::Missing secret MINT_AUTHORITY_SECRET_KEY (required: __constructor calls mint_authority.require_auth())"
+            missing=1
+          fi
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+          for name in BOOKING_CONTRACT MINT_AUTHORITY; do
+            ADDR="$(printf '%s' "${!name}" | tr -d '[:space:]')"
+            if [[ ! "${ADDR}" =~ ^C[A-Z0-9]{55}$ ]] && [[ ! "${ADDR}" =~ ^G[A-Z0-9]{55}$ ]]; then
+              echo "::error::${name} has invalid Stellar address format"
+              missing=1
+            fi
+            echo "${name}=${ADDR}" >> "${GITHUB_ENV}"
+          done
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Setup toolchain
+        uses: ./.github/actions/setup-contract-ci
+
+      - name: Prepare deployer + mint-authority identities
+        run: |
+          set -euo pipefail
+          STELLAR_CI_CONFIG="$(mktemp -d)"
+          chmod 700 "${STELLAR_CI_CONFIG}"
+          mkdir -p "${STELLAR_CI_CONFIG}/identity"
+          umask 077
+
+          printf 'secret_key = "%s"\n' "${STELLAR_SOURCE}" > "${STELLAR_CI_CONFIG}/identity/deployer.toml"
+          chmod 600 "${STELLAR_CI_CONFIG}/identity/deployer.toml"
+          DEPLOYER_ADDR="$(
+            stellar keys public-key deployer --config-dir "${STELLAR_CI_CONFIG}" \
+              | tr -d '[:space:]'
+          )"
+          if [[ -z "${DEPLOYER_ADDR}" || ! "${DEPLOYER_ADDR}" =~ ^G[A-Z0-9]{55}$ ]]; then
+            echo "::error::Could not derive address from STELLAR_TESTNET_SECRET_KEY"
+            rm -rf "${STELLAR_CI_CONFIG}"
+            exit 1
+          fi
+
+          printf 'secret_key = "%s"\n' "${MINT_AUTHORITY_SOURCE}" > "${STELLAR_CI_CONFIG}/identity/mint-authority.toml"
+          chmod 600 "${STELLAR_CI_CONFIG}/identity/mint-authority.toml"
+          MINT_ADDR="$(
+            stellar keys public-key mint-authority --config-dir "${STELLAR_CI_CONFIG}" \
+              | tr -d '[:space:]'
+          )"
+          if [[ -z "${MINT_ADDR}" || ! "${MINT_ADDR}" =~ ^G[A-Z0-9]{55}$ ]]; then
+            echo "::error::Could not derive address from MINT_AUTHORITY_SECRET_KEY"
+            rm -rf "${STELLAR_CI_CONFIG}"
+            exit 1
+          fi
+          if [[ "${MINT_ADDR}" != "${MINT_AUTHORITY}" ]]; then
+            echo "::error::MINT_AUTHORITY_SECRET_KEY derives to ${MINT_ADDR}, but Environment MINT_AUTHORITY is ${MINT_AUTHORITY}. Refusing deploy."
+            rm -rf "${STELLAR_CI_CONFIG}"
+            exit 1
+          fi
+
+          echo "STELLAR_CI_CONFIG=${STELLAR_CI_CONFIG}" >> "${GITHUB_ENV}"
+          echo "Verified deployer=${DEPLOYER_ADDR}"
+          echo "Verified mint-authority=${MINT_ADDR}"
+
+      - name: CI checks (must pass before release)
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Build optimized WASM from tagged commit (exact release artifact)
+        id: build
+        run: |
+          set -euo pipefail
+          SOURCE_REPO="github:${{ github.repository }}"
+          COMMIT_SHA="${{ github.sha }}"
+          stellar contract build \
+            --package stello_sbt_contract \
+            --optimize \
+            --meta "source_repo=${SOURCE_REPO}" \
+            --meta "commit_sha=${COMMIT_SHA}"
+          test -f "${WASM_PATH}"
+          echo "source_repo=${SOURCE_REPO}" >> "${GITHUB_OUTPUT}"
+          EXPECTED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "${EXPECTED_VERSION}" ]]; then
+            echo "::error::Could not parse package version from Cargo.toml"
+            exit 1
+          fi
+          echo "expected_version=${EXPECTED_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "EXPECTED_VERSION=${EXPECTED_VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Validate local WASM interface
+        run: |
+          set -euo pipefail
+          INTERFACE="$(stellar contract info interface --wasm "${WASM_PATH}")"
+          printf '%s\n' "${INTERFACE}"
+          python3 scripts/check_sbt_interface.py "${WASM_PATH}"
+
+      - name: Verify WASM provenance metadata before release (structured)
+        env:
+          EXPECTED_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null
+          META_JSON="$(stellar contract info meta --wasm "${WASM_PATH}" --output json)"
+          printf '%s\n' "${META_JSON}" | jq .
+
+          SOURCE_REPO="$(printf '%s\n' "${META_JSON}" | jq -r '.[] | .sc_meta_v0 | select(.key == "source_repo") | .val // empty')"
+          COMMIT_SHA="$(printf '%s\n' "${META_JSON}" | jq -r '.[] | .sc_meta_v0 | select(.key == "commit_sha") | .val // empty')"
+
+          if [[ -z "${SOURCE_REPO}" ]]; then
+            echo "::error::Missing contract meta key source_repo — refusing release"
+            exit 1
+          fi
+          if [[ -z "${COMMIT_SHA}" ]]; then
+            echo "::error::Missing contract meta key commit_sha — refusing release"
+            exit 1
+          fi
+          EXPECTED_SOURCE_REPO="github:${EXPECTED_REPO}"
+          if [[ "${SOURCE_REPO}" != "${EXPECTED_SOURCE_REPO}" ]]; then
+            echo "::error::source_repo (${SOURCE_REPO}) != ${EXPECTED_SOURCE_REPO}"
+            exit 1
+          fi
+          if [[ "${COMMIT_SHA}" != "${EXPECTED_SHA}" ]]; then
+            echo "::error::commit_sha (${COMMIT_SHA}) != github.sha (${EXPECTED_SHA})"
+            exit 1
+          fi
+
+      - name: Calculate SHA256 of release WASM (do not rebuild after)
+        id: sha
+        run: |
+          set -euo pipefail
+          FILE_SHA256="$(sha256sum "${WASM_PATH}" | awk '{print $1}' | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          LOCAL_STELLAR_HASH="$(stellar contract info hash --wasm "${WASM_PATH}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          echo "sha256sum=${FILE_SHA256}"
+          echo "stellar_info_hash_wasm=${LOCAL_STELLAR_HASH}"
+          if [[ ! "${FILE_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid local sha256sum format"
+            exit 1
+          fi
+          if [[ "${FILE_SHA256}" != "${LOCAL_STELLAR_HASH}" ]]; then
+            echo "::error::sha256sum (${FILE_SHA256}) != stellar contract info hash --wasm (${LOCAL_STELLAR_HASH})"
+            exit 1
+          fi
+          echo "wasm_sha256=${FILE_SHA256}" >> "${GITHUB_OUTPUT}"
+          echo "local_stellar_hash=${LOCAL_STELLAR_HASH}" >> "${GITHUB_OUTPUT}"
+          echo "LOCAL_WASM_SHA256=${FILE_SHA256}" >> "${GITHUB_ENV}"
+          mkdir -p deployment artifacts
+          cp "${WASM_PATH}" artifacts/stello_sbt_contract.wasm
+          echo "${FILE_SHA256}  stello_sbt_contract.wasm" > artifacts/SHA256SUMS
+
+      # GitHub Artifact Attestations require a public repo or a paid org plan.
+      # Private repos on unsupported plans fail with "Feature not available".
+      # Do not hard-fail Testnet deploy on that limitation; chain hash checks remain required.
+      - name: Attest exact release WASM (GitHub build provenance)
+        id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.WASM_PATH }}
+          subject-name: stello_sbt_contract.wasm
+
+      - name: Verify GitHub attestation for exact WASM
+        id: attest_verify
+        if: ${{ steps.attest.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          command -v gh >/dev/null
+          gh attestation verify "${WASM_PATH}" --repo "${{ github.repository }}"
+          echo "github_attestation_verification=pass" >> "${GITHUB_ENV}"
+          echo "attestation_status=verified" >> "${GITHUB_ENV}"
+
+      - name: Record attestation status when skipped or unavailable
+        if: ${{ steps.attest.outcome != 'success' }}
+        run: |
+          set -euo pipefail
+          echo "::warning::GitHub Artifact Attestations unavailable for this repository/plan; continuing deploy without attestation. Upgrade org billing or make the repo public to enable SEP-55 Build Verified."
+          echo "github_attestation_verification=skipped" >> "${GITHUB_ENV}"
+          echo "attestation_status=skipped" >> "${GITHUB_ENV}"
+
+      - name: Deploy exact WASM to Stellar Testnet (--optimize=false)
+        id: deploy
+        run: |
+          set -euo pipefail
+          if [[ -z "${STELLAR_CI_CONFIG:-}" || ! -d "${STELLAR_CI_CONFIG}" ]]; then
+            echo "::error::STELLAR_CI_CONFIG missing — identities were not prepared"
+            exit 1
+          fi
+          # Envelope signed by deployer (fee payer). Constructor mint_authority.require_auth()
+          # is a non-root Soroban auth entry — recorded with --auth-mode non-root and signed
+          # via --auto-sign using the mint-authority identity in the same config-dir.
+          # Do NOT pass --sign-with-key mint-authority: that replaces the envelope signer
+          # and causes TxBadAuth when source != mint authority.
+          set +e
+          DEPLOY_LOG="$(
+            stellar contract deploy \
+              --wasm "${WASM_PATH}" \
+              --optimize=false \
+              --source-account deployer \
+              --config-dir "${STELLAR_CI_CONFIG}" \
+              --auth-mode non-root \
+              --auto-sign \
+              --network "${NETWORK}" \
+              -- \
+              --booking_contract "${BOOKING_CONTRACT}" \
+              --mint_authority "${MINT_AUTHORITY}" \
+              2>&1
+          )"
+          DEPLOY_STATUS=$?
+          set -e
+
+          SAFE_LOG="$(printf '%s\n' "${DEPLOY_LOG}" | sed -E 's/S[A-Z0-9]{55}/[REDACTED_SECRET]/g')"
+          printf '%s\n' "${SAFE_LOG}" | tee deploy-output.txt
+
+          if [[ "${DEPLOY_STATUS}" -ne 0 ]]; then
+            echo "::error::stellar contract deploy failed"
+            exit "${DEPLOY_STATUS}"
+          fi
+
+          CONTRACT_ID="$(printf '%s\n' "${SAFE_LOG}" | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)"
+          if [[ -z "${CONTRACT_ID}" ]]; then
+            echo "::error::Could not parse Contract ID from deploy output"
+            exit 1
+          fi
+          echo "CONTRACT_ID=${CONTRACT_ID}"
+          echo "contract_id=${CONTRACT_ID}" >> "${GITHUB_OUTPUT}"
+          echo "CONTRACT_ID=${CONTRACT_ID}" >> "${GITHUB_ENV}"
+          echo "::notice::First deploy complete. Manually set GitHub Environment variable STELLO_TESTNET_CONTRACT_ID=${CONTRACT_ID} to lock this registry (blocks accidental redeploy)."
+
+      - name: Verify deployed interface
+        run: |
+          set -euo pipefail
+          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          INTERFACE="$(
+            stellar contract info interface \
+              --contract-id "${CONTRACT_ID}" \
+              --network "${NETWORK}"
+          )"
+          printf '%s\n' "${INTERFACE}"
+
+          for required in __constructor get_config mint_for_booking get_credential get_credential_by_booking is_review_eligible; do
+            if ! printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${required}\\b|fn[[:space:]]+${required}\\("; then
+              echo "::error::Required entrypoint missing on contract: ${required}"
+              exit 1
+            fi
+          done
+
+          for forbidden in upgrade transfer transfer_from approve set_approval_for_all burn revoke initialize; do
+            if printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${forbidden}\\b|fn[[:space:]]+${forbidden}\\("; then
+              echo "::error::Forbidden entrypoint on contract: ${forbidden}"
+              exit 1
+            fi
+          done
+
+      - name: Post-deploy get_config checks
+        id: post
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null
+          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+
+          invoke_view() {
+            local fn="$1"
+            stellar -q contract invoke \
+              --id "${CONTRACT_ID}" \
+              --source-account deployer \
+              --config-dir "${STELLAR_CI_CONFIG}" \
+              --network "${NETWORK}" \
+              --send=no \
+              -- \
+              "${fn}"
+          }
+
+          extract_json_object() {
+            RAW="$1" python3 - <<'PY'
+          import json, os, sys
+          text = os.environ["RAW"].strip()
+          for c in [text, *reversed(text.splitlines())]:
+              c = c.strip()
+              if not c:
+                  continue
+              try:
+                  obj = json.loads(c)
+              except json.JSONDecodeError:
+                  continue
+              if isinstance(obj, dict) and "booking_contract" in obj and "mint_authority" in obj:
+                  print(json.dumps(obj, sort_keys=True))
+                  sys.exit(0)
+          sys.stderr.write("get_config did not return a parseable JSON Config object\n")
+          sys.exit(1)
+          PY
+          }
+
+          CONFIG_RAW="$(invoke_view get_config)"
+          CONFIG_JSON="$(extract_json_object "${CONFIG_RAW}")"
+          printf '%s\n' "${CONFIG_JSON}" | jq -S -c . | tee config-output.txt >/dev/null
+          jq -S . config-output.txt
+
+          jq -e \
+            --arg booking_contract "${BOOKING_CONTRACT}" \
+            --arg mint_authority "${MINT_AUTHORITY}" \
+            '
+            (.booking_contract == $booking_contract)
+            and (.mint_authority == $mint_authority)
+            ' config-output.txt >/dev/null \
+            || {
+              echo "::error::get_config JSON does not exactly match Environment constructor vars"
+              exit 1
+            }
+
+          echo "config_validation=pass" >> "${GITHUB_ENV}"
+
+      - name: Three-way Wasm hash verification (file == --wasm == --contract-id)
+        id: hash_verify
+        run: |
+          set -euo pipefail
+          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+
+          FILE_SHA256="$(sha256sum "${WASM_PATH}" | awk '{print $1}' | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          LOCAL_STELLAR_HASH="$(stellar contract info hash --wasm "${WASM_PATH}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          DEPLOYED_STELLAR_HASH="$(
+            stellar contract info hash \
+              --contract-id "${CONTRACT_ID}" \
+              --network "${NETWORK}" \
+              | tr -d '[:space:]' | tr 'A-F' 'a-f'
+          )"
+
+          echo "sha256sum(local file)=${FILE_SHA256}"
+          echo "stellar contract info hash --wasm=${LOCAL_STELLAR_HASH}"
+          echo "stellar contract info hash --contract-id=${DEPLOYED_STELLAR_HASH}"
+
+          if [[ ! "${FILE_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid local file hash format"
+            exit 1
+          fi
+          if [[ "${FILE_SHA256}" != "${LOCAL_STELLAR_HASH}" ]]; then
+            echo "::error::sha256sum != stellar info hash --wasm"
+            exit 1
+          fi
+          if [[ "${LOCAL_STELLAR_HASH}" != "${DEPLOYED_STELLAR_HASH}" ]]; then
+            echo "::error::local stellar --wasm hash != deployed --contract-id hash"
+            exit 1
+          fi
+          PRE="$(printf '%s' "${{ steps.sha.outputs.wasm_sha256 }}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          if [[ "${FILE_SHA256}" != "${PRE}" ]]; then
+            echo "::error::WASM changed after SHA256 step (rebuild/transform detected)"
+            exit 1
+          fi
+
+          echo "deployed_wasm_hash=${DEPLOYED_STELLAR_HASH}" >> "${GITHUB_OUTPUT}"
+          echo "DEPLOYED_CONTRACT_WASM_HASH=${DEPLOYED_STELLAR_HASH}" >> "${GITHUB_ENV}"
+
+      - name: Stellar contract info build (bounded retry; may be eventually consistent)
+        id: build_info
+        run: |
+          set -euo pipefail
+          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          BUILD_INFO_STATUS="pending"
+          BUILD_INFO_LOG=""
+
+          for attempt in 1 2 3 4 5 6; do
+            echo "stellar contract info build attempt ${attempt}/6"
+            set +e
+            BUILD_INFO_LOG="$(
+              stellar contract info build \
+                --contract-id "${CONTRACT_ID}" \
+                --network "${NETWORK}" \
+                2>&1
+            )"
+            STATUS=$?
+            set -e
+            printf '%s\n' "${BUILD_INFO_LOG}"
+
+            if [[ "${STATUS}" -eq 0 ]]; then
+              if printf '%s\n' "${BUILD_INFO_LOG}" | grep -Eiq 'Attestation found|Build Verified|Workflow Run|github.com/.*/actions/runs'; then
+                BUILD_INFO_STATUS="verified"
+                break
+              fi
+              BUILD_INFO_STATUS="pending"
+            else
+              BUILD_INFO_STATUS="pending"
+            fi
+
+            if [[ "${attempt}" -lt 6 ]]; then
+              sleep 10
+            fi
+          done
+
+          {
+            echo "### stellar contract info build"
+            echo
+            echo '```'
+            printf '%s\n' "${BUILD_INFO_LOG}"
+            echo '```'
+            echo
+            echo "Stellar Build Info status: **${BUILD_INFO_STATUS}**"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "stellar_build_info=${BUILD_INFO_STATUS}" >> "${GITHUB_OUTPUT}"
+          echo "STELLAR_BUILD_INFO_STATUS=${BUILD_INFO_STATUS}" >> "${GITHUB_ENV}"
+          if [[ "${BUILD_INFO_STATUS}" != "verified" ]]; then
+            echo "::warning::Stellar Build Info remains pending after retries (release still OK if chain checks passed)"
+          fi
+
+      - name: Write deployment/testnet.json
+        env:
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          WASM_SHA256: ${{ steps.sha.outputs.wasm_sha256 }}
+          GIT_TAG: ${{ github.ref_name }}
+          GIT_COMMIT: ${{ github.sha }}
+          SOURCE_REPO: github:${{ github.repository }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+          DEPLOYED_WASM_HASH: ${{ steps.hash_verify.outputs.deployed_wasm_hash }}
+          BOOKING_CONTRACT: ${{ env.BOOKING_CONTRACT }}
+          MINT_AUTHORITY: ${{ env.MINT_AUTHORITY }}
+          CONTRACT_VERSION: ${{ steps.build.outputs.expected_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p deployment artifacts
+          python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          data = {
+              "network": "testnet",
+              "release_mode": "deploy",
+              "contract_id": os.environ["CONTRACT_ID"],
+              "git_commit_sha": os.environ["GIT_COMMIT"],
+              "git_tag": os.environ["GIT_TAG"],
+              "contract_version": os.environ.get("CONTRACT_VERSION", ""),
+              "local_wasm_sha256": os.environ["WASM_SHA256"],
+              "uploaded_wasm_hash": os.environ["WASM_SHA256"],
+              "deployed_contract_wasm_hash": os.environ.get("DEPLOYED_WASM_HASH", ""),
+              "booking_contract": os.environ["BOOKING_CONTRACT"],
+              "mint_authority": os.environ["MINT_AUTHORITY"],
+              "deployed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "source_repo": os.environ["SOURCE_REPO"],
+              "upgrade_supported": False,
+          }
+
+          att = os.environ.get("ATTESTATION_URL", "").strip()
+          if att:
+              data["attestation_url"] = att
+
+          path = Path("deployment/testnet.json")
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          Path("artifacts/testnet.json").write_text(path.read_text())
+          print(path.read_text())
+          PY
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stello_sbt_contract-testnet-${{ github.ref_name }}
+          path: |
+            artifacts/stello_sbt_contract.wasm
+            artifacts/SHA256SUMS
+            artifacts/testnet.json
+          if-no-files-found: error
+
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          WASM_SHA256="${{ steps.sha.outputs.wasm_sha256 }}"
+          VERSION="${EXPECTED_VERSION:-}"
+          ATTEST_STATUS="${attestation_status:-skipped}"
+          if [[ "${ATTEST_STATUS}" == "verified" ]]; then
+            ATTEST_LINE="Build provenance: GitHub Attestation verified"
+            if [[ -n "${ATTESTATION_URL:-}" ]]; then
+              ATTEST_LINE="${ATTEST_LINE}
+          Attestation URL: ${ATTESTATION_URL}"
+            fi
+          else
+            ATTEST_LINE="Build provenance: skipped (GitHub Artifact Attestations unavailable for this org/plan)"
+          fi
+
+          NOTES="$(cat <<EOF
+          Stello SBT Contract — Testnet
+
+          Git tag: ${TAG}
+          Git commit: ${{ github.sha }}
+          Contract ID: ${CONTRACT_ID}
+          Package version: ${VERSION}
+          WASM SHA256: ${WASM_SHA256}
+          Network: Stellar Testnet
+          Mode: DEPLOY (new Contract ID; no on-chain upgrade path)
+          Booking contract: ${BOOKING_CONTRACT}
+          Mint authority: ${MINT_AUTHORITY}
+          IMPORTANT: Set GitHub Environment variable STELLO_TESTNET_CONTRACT_ID=${CONTRACT_ID} to lock this registry and block accidental redeploy.
+          ${ATTEST_LINE}
+
+          Artifacts: WASM, SHA256SUMS, deployment/testnet.json
+          EOF
+          )"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              artifacts/stello_sbt_contract.wasm \
+              artifacts/SHA256SUMS \
+              artifacts/testnet.json \
+              --clobber
+            gh release edit "${TAG}" --prerelease --notes "${NOTES}"
+          else
+            gh release create "${TAG}" \
+              artifacts/stello_sbt_contract.wasm \
+              artifacts/SHA256SUMS \
+              artifacts/testnet.json \
+              --prerelease \
+              --title "Stello SBT Contract ${TAG}" \
+              --notes "${NOTES}" \
+              --target "${{ github.sha }}"
+          fi
+
+      - name: Release summary
+        if: ${{ success() }}
+        run: |
+          set -euo pipefail
+          BUILD_INFO_STATUS="${STELLAR_BUILD_INFO_STATUS:-pending}"
+          {
+            echo "## Stello SBT Testnet Release"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Mode | \`deploy\` |"
+            echo "| Tag | \`${{ github.ref_name }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Contract ID | \`${{ steps.deploy.outputs.contract_id }}\` |"
+            echo "| Package version | \`${EXPECTED_VERSION:-}\` |"
+            echo "| Local WASM SHA256 | \`${{ steps.sha.outputs.wasm_sha256 }}\` |"
+            echo "| Deployed WASM hash | \`${DEPLOYED_CONTRACT_WASM_HASH:-}\` |"
+            echo "| Booking contract | \`${BOOKING_CONTRACT}\` |"
+            echo "| Mint authority | \`${MINT_AUTHORITY}\` |"
+            echo "| Configure next | Set \`STELLO_TESTNET_CONTRACT_ID\` to this Contract ID |"
+            echo "| Interface verification | PASS |"
+            echo "| Hash verification | PASS |"
+            echo "| Build Attestation | ${attestation_status:-skipped} |"
+            echo "| GitHub Attestation Verification | ${github_attestation_verification:-skipped} |"
+            echo "| Stellar Build Info | ${BUILD_INFO_STATUS} |"
+            echo "| Upgrade | not supported (by design) |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Cleanup temporary Stellar CLI identity
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${STELLAR_CI_CONFIG:-}" && -d "${STELLAR_CI_CONFIG}" ]]; then
+            rm -rf "${STELLAR_CI_CONFIG}"
+            echo "Removed temporary STELLAR_CI_CONFIG"
+          fi
