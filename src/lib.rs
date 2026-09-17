@@ -510,6 +510,31 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn self_referential_configuration_panics_during_construction() {
+        let env = test_env();
+        let contract_id = Address::generate(&env);
+        let mint_authority = Address::generate(&env);
+        env.register_at(
+            &contract_id,
+            StelloSbtEngine,
+            (&contract_id, &mint_authority),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn reinitializing_configured_instance_panics_with_already_initialized() {
+        let env = test_env();
+        let booking_contract = Address::generate(&env);
+        let mint_authority = Address::generate(&env);
+        let sbt = env.register(StelloSbtEngine, (&booking_contract, &mint_authority));
+        env.as_contract(&sbt, || {
+            StelloSbtEngine::__constructor(env.clone(), booking_contract, mint_authority);
+        });
+    }
+
+    #[test]
     fn mint_authority_auth_invocation_is_recorded() {
         let env = test_env();
         let authority = Address::generate(&env);
