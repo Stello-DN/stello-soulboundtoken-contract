@@ -96,7 +96,8 @@ fn require_mint_authority(_env: &Env, mint_authority: &Address) {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        Env, testutils::Address as _, testutils::Events as _, testutils::storage::Instance as _,
+        Env, Event as _, testutils::Address as _, testutils::Events as _,
+        testutils::storage::Instance as _,
     };
 
     #[test]
@@ -148,7 +149,7 @@ mod tests {
         env.as_contract(&contract_id, || {
             assert!(!valid_configuration(&env, &contract_id, &authority));
             assert!(!valid_configuration(&env, &booking, &contract_id));
-            assert!(env.storage().instance().get_ttl() > 0);
+            assert!(env.storage().instance().get_ttl() >= INSTANCE_TTL_EXTEND_TO);
         });
     }
 
@@ -158,13 +159,14 @@ mod tests {
         let booking = Address::generate(&env);
         let authority = Address::generate(&env);
         let contract_id = env.register(StelloSbtEngine, (&booking, &authority));
-        env.as_contract(&contract_id, || {
-            SbtInitialized {
-                booking_contract: booking.clone(),
-                mint_authority: authority.clone(),
-            }
-            .publish(&env);
-        });
-        assert_eq!(env.events().all().events().len(), 1);
+        let expected = SbtInitialized {
+            booking_contract: booking.clone(),
+            mint_authority: authority.clone(),
+        };
+        env.as_contract(&contract_id, || expected.publish(&env));
+        assert_eq!(
+            env.events().all().events(),
+            [expected.to_xdr(&env, &contract_id)]
+        );
     }
 }
