@@ -87,6 +87,22 @@ numeric codes:
 | 12 | CredentialIdOverflow | Checked counter increment fails |
 | 13 | AlreadyInitialized | Defensive rejection of repeated initialization |
 | 14 | InvalidWasmHash | Upgrade rejected because the WASM hash is all zeros |
+| 15 | ReviewAlreadySubmitted | Booking already has a ReviewStatus with a different hash |
+| 16 | InvalidReviewHash | Review hash is all zeros |
+
+### `ReviewMarked` — topics `["review", "marked", credential_id]`
+
+| Field | Type | Encoding |
+|---|---|---|
+| credential_id | u64 | Topic |
+| booking_contract | Address | Data |
+| booking_id | u64 | Data |
+| traveller | Address | Data; equals `ReviewStatus.reviewer` / credential owner |
+| review_hash | BytesN of 32 | Data |
+| reviewed_at | u64 | Data |
+
+Emitted exactly once on the first successful `mark_reviewed`. Same-hash
+idempotent retries do not emit again.
 
 Coverage by category (STELLO-35 acceptance criterion: "Errors cover
 initialization, authorization, invalid input, duplicate issuance and missing

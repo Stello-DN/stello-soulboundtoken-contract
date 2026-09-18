@@ -17,6 +17,8 @@ EXPECTED = {
     "get_credential": [("credential_id", "u64")],
     "get_credential_by_booking": [("booking_id", "u64")],
     "is_review_eligible": [("booking_id", "u64"), ("traveller", "address")],
+    "mark_reviewed": [("booking_id", "u64"), ("review_hash", "bytesN<32>")],
+    "get_review_status": [("booking_id", "u64")],
     "upgrade": [("new_wasm_hash", "bytesN<32>")],
     "set_upgrade_authority": [("new_upgrade_authority", "address")],
     "contract_version": [],
@@ -68,8 +70,8 @@ def main():
         if name in actual:
             raise SystemExit(f"Forbidden ownership-changing entrypoint present: {name}")
     print(
-        "PASS: approved entrypoints include upgrade/set_upgrade_authority/"
-        "contract_version; no transfer, approval, owner setter, or burn API; "
+        "PASS: approved entrypoints include review + upgrade APIs; "
+        "no transfer, approval, owner setter, or burn API; "
         "mint accepts only booking_id."
     )
 
