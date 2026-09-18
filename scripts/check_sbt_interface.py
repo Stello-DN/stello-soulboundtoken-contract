@@ -7,13 +7,40 @@ import sys
 
 
 EXPECTED = {
-    "__constructor": [("booking_contract", "address"), ("mint_authority", "address")],
+    "__constructor": [
+        ("booking_contract", "address"),
+        ("mint_authority", "address"),
+        ("upgrade_authority", "address"),
+    ],
     "get_config": [],
     "mint_for_booking": [("booking_id", "u64")],
     "get_credential": [("credential_id", "u64")],
     "get_credential_by_booking": [("booking_id", "u64")],
     "is_review_eligible": [("booking_id", "u64"), ("traveller", "address")],
+    "upgrade": [("new_wasm_hash", "bytesN<32>")],
+    "set_upgrade_authority": [("new_upgrade_authority", "address")],
+    "contract_version": [],
 }
+
+FORBIDDEN = (
+    "transfer",
+    "transfer_from",
+    "approve",
+    "set_approval_for_all",
+    "burn",
+    "revoke",
+    "initialize",
+    "set_owner",
+)
+
+
+def normalize_type(type_spec):
+    if isinstance(type_spec, str):
+        return type_spec
+    if isinstance(type_spec, dict):
+        if "bytes_n" in type_spec:
+            return f"bytesN<{type_spec['bytes_n']['n']}>"
+    raise SystemExit(f"Unsupported interface type encoding: {type_spec!r}")
 
 
 def main():
@@ -27,12 +54,24 @@ def main():
     )
     functions = [entry["function_v0"] for entry in json.loads(result.stdout)
                  if "function_v0" in entry]
-    actual = {fn["name"]: [(arg["name"], arg["type"]) for arg in fn["inputs"]]
-              for fn in functions}
+    actual = {
+        fn["name"]: [
+            (arg["name"], normalize_type(arg["type"])) for arg in fn["inputs"]
+        ]
+        for fn in functions
+    }
     if len(functions) != len(EXPECTED) or actual != EXPECTED:
-        raise SystemExit(f"SBT interface changed; review ownership safety. Actual: {actual}")
-    print("PASS: six approved entrypoints; no transfer, approval, owner setter, "
-          "burn or upgrade API; mint accepts only booking_id.")
+        raise SystemExit(
+            f"SBT interface changed; review ownership safety. Actual: {actual}"
+        )
+    for name in FORBIDDEN:
+        if name in actual:
+            raise SystemExit(f"Forbidden ownership-changing entrypoint present: {name}")
+    print(
+        "PASS: approved entrypoints include upgrade/set_upgrade_authority/"
+        "contract_version; no transfer, approval, owner setter, or burn API; "
+        "mint accepts only booking_id."
+    )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    Address, BytesN, Env, IntoVal, InvokeError, Symbol, contract, contracterror, contractevent,
-    contractimpl, contracttype, vec,
+    Address, BytesN, Env, IntoVal, InvokeError, String, Symbol, contract, contracterror,
+    contractevent, contractimpl, contracttype, vec,
 };
 
 pub const INSTANCE_TTL_THRESHOLD: u32 = 100_000;
@@ -27,6 +27,7 @@ pub enum Error {
     StorageInvariantViolation = 11,
     CredentialIdOverflow = 12,
     AlreadyInitialized = 13,
+    InvalidWasmHash = 14,
 }
 
 #[contracttype]
@@ -34,6 +35,7 @@ pub enum Error {
 pub struct Config {
     pub booking_contract: Address,
     pub mint_authority: Address,
+    pub upgrade_authority: Address,
 }
 
 #[contracttype]
@@ -77,6 +79,20 @@ pub struct SbtMinted {
 pub struct SbtInitialized {
     pub booking_contract: Address,
     pub mint_authority: Address,
+    pub upgrade_authority: Address,
+}
+
+#[contractevent(topics = ["contract", "upgraded"])]
+pub struct ContractUpgraded {
+    pub new_wasm_hash: BytesN<32>,
+    pub upgraded_at: u64,
+}
+
+#[contractevent(topics = ["authority", "upgrade_changed"])]
+pub struct UpgradeAuthorityChanged {
+    pub previous_authority: Address,
+    pub new_authority: Address,
+    pub changed_at: u64,
 }
 
 #[contracttype]
@@ -153,19 +169,26 @@ pub struct StelloSbtEngine;
 
 #[contractimpl]
 impl StelloSbtEngine {
-    pub fn __constructor(env: Env, booking_contract: Address, mint_authority: Address) {
+    pub fn __constructor(
+        env: Env,
+        booking_contract: Address,
+        mint_authority: Address,
+        upgrade_authority: Address,
+    ) {
         if env.storage().instance().has(&DataKey::Config) {
             soroban_sdk::panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        if !valid_configuration(&env, &booking_contract, &mint_authority) {
+        if !valid_configuration(&env, &booking_contract, &mint_authority, &upgrade_authority) {
             soroban_sdk::panic_with_error!(&env, Error::InvalidConfiguration);
         }
         mint_authority.require_auth();
+        upgrade_authority.require_auth();
         env.storage().instance().set(
             &DataKey::Config,
             &Config {
                 booking_contract: booking_contract.clone(),
                 mint_authority: mint_authority.clone(),
+                upgrade_authority: upgrade_authority.clone(),
             },
         );
         env.storage()
@@ -175,12 +198,76 @@ impl StelloSbtEngine {
         SbtInitialized {
             booking_contract,
             mint_authority,
+            upgrade_authority,
         }
         .publish(&env);
     }
 
     pub fn get_config(env: Env) -> Result<Config, Error> {
         load_config(&env)
+    }
+
+    /// Replace this contract's WASM executable.
+    /// **Auth:** `upgrade_authority` only (not `mint_authority`).
+    ///
+    /// `new_wasm_hash` must already be uploaded on-ledger (`stellar contract upload`).
+    /// Contract ID and persistent credential storage are preserved; this is **not**
+    /// an automatic schema migration.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let config = load_config(&env)?;
+        config.upgrade_authority.require_auth();
+        if new_wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::InvalidWasmHash);
+        }
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        bump_instance_ttl(&env);
+        ContractUpgraded {
+            new_wasm_hash,
+            upgraded_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Rotate WASM upgrade authority.
+    ///
+    /// **Auth:** current `upgrade_authority` only.
+    /// Rejects `new_upgrade_authority == mint_authority` so operational mint keys
+    /// cannot become upgrade keys through rotation.
+    ///
+    /// Testnet may use a single admin wallet. For Mainnet, prefer configuring a
+    /// multisig or timelock contract as `upgrade_authority`. This SBT contract
+    /// does not implement key custody, multisig, or timelock logic itself.
+    pub fn set_upgrade_authority(env: Env, new_upgrade_authority: Address) -> Result<(), Error> {
+        let mut config = load_config(&env)?;
+        config.upgrade_authority.require_auth();
+        if new_upgrade_authority == config.mint_authority {
+            return Err(Error::InvalidConfiguration);
+        }
+        if new_upgrade_authority == env.current_contract_address() {
+            return Err(Error::InvalidConfiguration);
+        }
+        if new_upgrade_authority == config.upgrade_authority {
+            return Ok(());
+        }
+        let previous_authority = config.upgrade_authority.clone();
+        config.upgrade_authority = new_upgrade_authority.clone();
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance_ttl(&env);
+        UpgradeAuthorityChanged {
+            previous_authority,
+            new_authority: new_upgrade_authority,
+            changed_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Compile-time package version string (e.g. `"0.2.0"`).
+    /// **Read-only** — no auth, no storage, no TTL mutation.
+    pub fn contract_version(env: Env) -> String {
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 
     pub fn mint_for_booking(env: Env, booking_id: u64) -> Result<u64, Error> {
@@ -329,9 +416,17 @@ fn load_config(env: &Env) -> Result<Config, Error> {
         .ok_or(Error::NotInitialized)
 }
 
-fn valid_configuration(env: &Env, booking_contract: &Address, mint_authority: &Address) -> bool {
-    booking_contract != &env.current_contract_address()
-        && mint_authority != &env.current_contract_address()
+fn valid_configuration(
+    env: &Env,
+    booking_contract: &Address,
+    mint_authority: &Address,
+    upgrade_authority: &Address,
+) -> bool {
+    let self_addr = env.current_contract_address();
+    booking_contract != &self_addr
+        && mint_authority != &self_addr
+        && upgrade_authority != &self_addr
+        && mint_authority != upgrade_authority
 }
 
 fn fetch_booking(env: &Env, contract: &Address, booking_id: u64) -> Result<Booking, Error> {
@@ -455,11 +550,28 @@ mod tests {
         }
     }
 
-    fn setup(env: &Env, record: Booking) -> (StelloSbtEngineClient<'_>, Address, Address) {
+    fn setup(env: &Env, record: Booking) -> (StelloSbtEngineClient<'_>, Address, Address, Address) {
         let provider = env.register(MockBookingContract, (Some(record),));
-        let authority = Address::generate(env);
-        let sbt = env.register(StelloSbtEngine, (&provider, &authority));
-        (StelloSbtEngineClient::new(env, &sbt), provider, authority)
+        let mint_authority = Address::generate(env);
+        let upgrade_authority = Address::generate(env);
+        let sbt = env.register(
+            StelloSbtEngine,
+            (&provider, &mint_authority, &upgrade_authority),
+        );
+        (
+            StelloSbtEngineClient::new(env, &sbt),
+            provider,
+            mint_authority,
+            upgrade_authority,
+        )
+    }
+
+    fn register_sbt(env: &Env, booking_contract: &Address, mint_authority: &Address) -> Address {
+        let upgrade_authority = Address::generate(env);
+        env.register(
+            StelloSbtEngine,
+            (booking_contract, mint_authority, &upgrade_authority),
+        )
     }
 
     #[test]
@@ -467,18 +579,24 @@ mod tests {
         let env = test_env();
         let booking_contract = Address::generate(&env);
         let mint_authority = Address::generate(&env);
-        let sbt = env.register(StelloSbtEngine, (&booking_contract, &mint_authority));
+        let upgrade_authority = Address::generate(&env);
+        let sbt = env.register(
+            StelloSbtEngine,
+            (&booking_contract, &mint_authority, &upgrade_authority),
+        );
         let client = StelloSbtEngineClient::new(&env, &sbt);
         assert_eq!(
             client.get_config(),
             Config {
                 booking_contract: booking_contract.clone(),
-                mint_authority: mint_authority.clone()
+                mint_authority: mint_authority.clone(),
+                upgrade_authority: upgrade_authority.clone(),
             }
         );
         let expected = SbtInitialized {
             booking_contract,
             mint_authority,
+            upgrade_authority,
         };
         env.as_contract(&sbt, || expected.publish(&env));
         assert_eq!(env.events().all().events(), [expected.to_xdr(&env, &sbt)]);
@@ -488,7 +606,8 @@ mod tests {
     fn same_address_configuration_is_allowed() {
         let env = test_env();
         let address = Address::generate(&env);
-        let sbt = env.register(StelloSbtEngine, (&address, &address));
+        let upgrade_authority = Address::generate(&env);
+        let sbt = env.register(StelloSbtEngine, (&address, &address, &upgrade_authority));
         assert_eq!(
             StelloSbtEngineClient::new(&env, &sbt)
                 .get_config()
@@ -498,14 +617,49 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn mint_equals_upgrade_authority_is_rejected() {
+        let env = test_env();
+        let booking_contract = Address::generate(&env);
+        let authority = Address::generate(&env);
+        env.register(StelloSbtEngine, (&booking_contract, &authority, &authority));
+    }
+
+    #[test]
     fn self_referential_configuration_is_rejected() {
         let env = test_env();
         let booking_contract = Address::generate(&env);
         let mint_authority = Address::generate(&env);
-        let sbt = env.register(StelloSbtEngine, (&booking_contract, &mint_authority));
+        let upgrade_authority = Address::generate(&env);
+        let sbt = env.register(
+            StelloSbtEngine,
+            (&booking_contract, &mint_authority, &upgrade_authority),
+        );
         env.as_contract(&sbt, || {
-            assert!(!valid_configuration(&env, &sbt, &mint_authority));
-            assert!(!valid_configuration(&env, &booking_contract, &sbt));
+            assert!(!valid_configuration(
+                &env,
+                &sbt,
+                &mint_authority,
+                &upgrade_authority
+            ));
+            assert!(!valid_configuration(
+                &env,
+                &booking_contract,
+                &sbt,
+                &upgrade_authority
+            ));
+            assert!(!valid_configuration(
+                &env,
+                &booking_contract,
+                &mint_authority,
+                &sbt
+            ));
+            assert!(!valid_configuration(
+                &env,
+                &booking_contract,
+                &mint_authority,
+                &mint_authority
+            ));
         });
     }
 
@@ -515,10 +669,11 @@ mod tests {
         let env = test_env();
         let contract_id = Address::generate(&env);
         let mint_authority = Address::generate(&env);
+        let upgrade_authority = Address::generate(&env);
         env.register_at(
             &contract_id,
             StelloSbtEngine,
-            (&contract_id, &mint_authority),
+            (&contract_id, &mint_authority, &upgrade_authority),
         );
     }
 
@@ -528,9 +683,18 @@ mod tests {
         let env = test_env();
         let booking_contract = Address::generate(&env);
         let mint_authority = Address::generate(&env);
-        let sbt = env.register(StelloSbtEngine, (&booking_contract, &mint_authority));
+        let upgrade_authority = Address::generate(&env);
+        let sbt = env.register(
+            StelloSbtEngine,
+            (&booking_contract, &mint_authority, &upgrade_authority),
+        );
         env.as_contract(&sbt, || {
-            StelloSbtEngine::__constructor(env.clone(), booking_contract, mint_authority);
+            StelloSbtEngine::__constructor(
+                env.clone(),
+                booking_contract,
+                mint_authority,
+                upgrade_authority,
+            );
         });
     }
 
@@ -538,7 +702,7 @@ mod tests {
     fn mint_authority_auth_invocation_is_recorded() {
         let env = test_env();
         let authority = Address::generate(&env);
-        let sbt = env.register(StelloSbtEngine, (&Address::generate(&env), &authority));
+        let sbt = register_sbt(&env, &Address::generate(&env), &authority);
         env.mock_all_auths();
         env.as_contract(&sbt, || authority.require_auth());
         assert_eq!(env.auths()[0].0, authority);
@@ -557,7 +721,7 @@ mod tests {
             false,
             &traveller,
         );
-        let (client, provider, authority) = setup(&env, record);
+        let (client, provider, authority, _) = setup(&env, record);
         let id = client.mock_all_auths().mint_for_booking(&7);
         let issued_at = env.ledger().timestamp();
         let all_events = env.events().all();
@@ -627,7 +791,7 @@ mod tests {
             false,
             &traveller,
         );
-        let (client, _, _) = setup(&env, record);
+        let (client, _, _, _) = setup(&env, record);
         let first = client.mock_all_auths().mint_for_booking(&1);
         let second = client.mock_all_auths().mint_for_booking(&1);
         assert_eq!(first, second);
@@ -697,7 +861,7 @@ mod tests {
             let env = test_env();
             let traveller = Address::generate(&env);
             let record = booking(&env, 1, state, settled, cancelled, disputed, &traveller);
-            let (client, _, _) = setup(&env, record);
+            let (client, _, _, _) = setup(&env, record);
             assert_eq!(
                 client
                     .mock_all_auths()
@@ -713,7 +877,7 @@ mod tests {
         let env = test_env();
         let authority = Address::generate(&env);
         let provider = env.register(MockBookingContract, (None::<Booking>,));
-        let sbt = env.register(StelloSbtEngine, (&provider, &authority));
+        let sbt = register_sbt(&env, &provider, &authority);
         let client = StelloSbtEngineClient::new(&env, &sbt);
         assert_eq!(
             client
@@ -737,7 +901,7 @@ mod tests {
             false,
             &traveller,
         );
-        let (client, _, _) = setup(&env, record);
+        let (client, _, _, _) = setup(&env, record);
         env.set_auths(&[]);
         assert!(client.try_mint_for_booking(&1).is_err());
         assert_unissued(&env, &client, 1);
@@ -774,7 +938,7 @@ mod tests {
     #[test]
     fn provider_failure_leaves_no_issuance() {
         let env = test_env();
-        let (client, provider, _) = setup(&env, eligible(&env, 1));
+        let (client, provider, _, _) = setup(&env, eligible(&env, 1));
         env.as_contract(&provider, || {
             env.storage()
                 .instance()
@@ -800,7 +964,7 @@ mod tests {
     fn provider_decode_failure_leaves_no_issuance() {
         let env = test_env();
         let provider = env.register(MalformedProvider, ());
-        let sbt = env.register(StelloSbtEngine, (&provider, &Address::generate(&env)));
+        let sbt = register_sbt(&env, &provider, &Address::generate(&env));
         let client = StelloSbtEngineClient::new(&env, &sbt);
         assert_eq!(
             client.mock_all_auths().try_mint_for_booking(&1),
@@ -822,7 +986,7 @@ mod tests {
             record.settled = false;
             record.was_cancelled = cancelled;
             record.was_disputed = disputed;
-            let (client, _, _) = setup(&env, record);
+            let (client, _, _, _) = setup(&env, record);
             assert_eq!(
                 client.mock_all_auths().try_mint_for_booking(&requested),
                 Err(Ok(expected))
@@ -836,7 +1000,7 @@ mod tests {
         let env = test_env();
         let record = eligible(&env, 1);
         let owner = record.traveller.clone();
-        let (client, provider, _) = setup(&env, record.clone());
+        let (client, provider, _, _) = setup(&env, record.clone());
         assert!(!client.is_review_eligible(&1, &owner));
         assert_eq!(
             client.try_get_credential(&0),
@@ -880,7 +1044,7 @@ mod tests {
             let env = test_env();
             let record = eligible(&env, 1);
             let owner = record.traveller.clone();
-            let (client, _, _) = setup(&env, record);
+            let (client, _, _, _) = setup(&env, record);
             let id = client.mock_all_auths().mint_for_booking(&1);
             let mut credential = client.get_credential(&id);
             env.as_contract(&client.address, || {
@@ -935,7 +1099,7 @@ mod tests {
     fn reverse_index_and_allocated_range_are_validated() {
         for index in [None, Some(0_u64), Some(2_u64)] {
             let env = test_env();
-            let (client, provider, _) = setup(&env, eligible(&env, 1));
+            let (client, provider, _, _) = setup(&env, eligible(&env, 1));
             let id = client.mock_all_auths().mint_for_booking(&1);
             env.as_contract(&client.address, || {
                 let key = DataKey::Issuance(BookingKey {
@@ -968,7 +1132,7 @@ mod tests {
     #[test]
     fn uninitialized_queries_fail_closed() {
         let env = test_env();
-        let (client, _, _) = setup(&env, eligible(&env, 1));
+        let (client, _, _, _) = setup(&env, eligible(&env, 1));
         env.as_contract(&client.address, || {
             env.storage().instance().remove(&DataKey::Config)
         });
@@ -989,7 +1153,7 @@ mod tests {
     #[test]
     fn mint_and_config_fail_closed_without_initialization() {
         let env = test_env();
-        let (client, _, _) = setup(&env, eligible(&env, 1));
+        let (client, _, _, _) = setup(&env, eligible(&env, 1));
         env.as_contract(&client.address, || {
             env.storage().instance().remove(&DataKey::Config)
         });
@@ -1008,7 +1172,7 @@ mod tests {
     fn counter_overflow_and_occupied_slot_do_not_partially_mint() {
         for occupied in [false, true] {
             let env = test_env();
-            let (client, provider, _) = setup(&env, eligible(&env, 1));
+            let (client, provider, _, _) = setup(&env, eligible(&env, 1));
             env.as_contract(&client.address, || {
                 if occupied {
                     env.storage()
@@ -1058,7 +1222,7 @@ mod tests {
         let env = test_env();
         let record = eligible(&env, 1);
         let owner = record.traveller.clone();
-        let (client, provider, _) = setup(&env, record);
+        let (client, provider, _, _) = setup(&env, record);
         let id = client.mock_all_auths().mint_for_booking(&1);
         let original = client.get_credential(&id);
         let keys = [
@@ -1108,7 +1272,7 @@ mod tests {
         let record = eligible(&env, 1);
         let owner = record.traveller.clone();
         let recipient = Address::generate(&env);
-        let (client, _, _) = setup(&env, record);
+        let (client, _, _, _) = setup(&env, record);
         let id = client.mock_all_auths().mint_for_booking(&1);
         let original = client.get_credential(&id);
         // Grant every requested authorization: absence of an ownership-changing
@@ -1174,7 +1338,7 @@ mod tests {
         let mut record = eligible(&env, 1);
         let owner = record.traveller.clone();
         let replacement = Address::generate(&env);
-        let (client, provider, _) = setup(&env, record.clone());
+        let (client, provider, _, _) = setup(&env, record.clone());
         let id = client.mock_all_auths().mint_for_booking(&1);
         let original = client.get_credential(&id);
         record.traveller = replacement.clone();
@@ -1228,7 +1392,7 @@ mod tests {
     #[test]
     fn another_contract_cannot_overwrite_sbt_storage_with_identical_keys() {
         let env = test_env();
-        let (client, _, _) = setup(&env, eligible(&env, 1));
+        let (client, _, _, _) = setup(&env, eligible(&env, 1));
         let id = client.mock_all_auths().mint_for_booking(&1);
         let original = client.get_credential(&id);
         let mut forged = original.clone();
@@ -1247,5 +1411,243 @@ mod tests {
         assert_eq!(client.get_credential_by_booking(&1), Some(original.clone()));
         assert!(client.is_review_eligible(&1, &original.owner));
         assert!(!client.is_review_eligible(&1, &forged.owner));
+    }
+
+    fn dummy_wasm_hash(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[0xABu8; 32])
+    }
+
+    #[test]
+    fn contract_version_is_read_only_package_version() {
+        let env = test_env();
+        let (client, _, _, _) = setup(&env, eligible(&env, 1));
+        env.set_auths(&[]);
+        let v = client.contract_version();
+        assert_eq!(v, String::from_str(&env, env!("CARGO_PKG_VERSION")));
+        assert_eq!(v, String::from_str(&env, "0.2.0"));
+    }
+
+    #[test]
+    fn upgrade_rejects_without_any_auth() {
+        let env = test_env();
+        let (client, _, _, _) = setup(&env, eligible(&env, 1));
+        let hash = dummy_wasm_hash(&env);
+        env.set_auths(&[]);
+        assert!(
+            client.try_upgrade(&hash).is_err(),
+            "upgrade must fail without upgrade_authority authorization"
+        );
+    }
+
+    #[test]
+    fn upgrade_rejects_mint_authority_auth_only() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let (client, _, mint_authority, _) = setup(&env, eligible(&env, 1));
+        let hash = dummy_wasm_hash(&env);
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &mint_authority,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_upgrade(&hash).is_err());
+    }
+
+    #[test]
+    fn upgrade_rejects_traveller_and_stranger_auth_only() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let record = eligible(&env, 1);
+        let traveller = record.traveller.clone();
+        let (client, _, _, _) = setup(&env, record);
+        let hash = dummy_wasm_hash(&env);
+        let stranger = Address::generate(&env);
+        for signer in [&traveller, &stranger] {
+            env.set_auths(&[]);
+            env.mock_auths(&[MockAuth {
+                address: signer,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "upgrade",
+                    args: (hash.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }]);
+            assert!(client.try_upgrade(&hash).is_err());
+        }
+    }
+
+    #[test]
+    fn upgrade_rejects_all_zero_wasm_hash() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let (client, _, _, upgrade_authority) = setup(&env, eligible(&env, 1));
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &upgrade_authority,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "upgrade",
+                args: (zero.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(
+            client.try_upgrade(&zero).unwrap_err(),
+            Ok(Error::InvalidWasmHash)
+        );
+    }
+
+    #[test]
+    fn upgrade_with_upgrade_authority_reaches_wasm_update() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        // Native unit tests do not ship a replacement Wasm blob. With only
+        // upgrade_authority mocked, the call must pass require_auth and reach
+        // update_current_contract_wasm (which then fails because the hash is
+        // not uploaded). Credential state must remain intact.
+        let env = test_env();
+        let (client, _, _, upgrade_authority) = setup(&env, eligible(&env, 1));
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let before = client.get_credential(&id);
+        let config_before = client.get_config();
+        let hash = dummy_wasm_hash(&env);
+
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &upgrade_authority,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let err = client.try_upgrade(&hash);
+        assert!(
+            err.is_err(),
+            "missing uploaded Wasm should not silently succeed"
+        );
+        assert_eq!(client.get_credential(&id), before);
+        assert_eq!(client.get_config(), config_before);
+    }
+
+    #[test]
+    fn set_upgrade_authority_rejects_unauthorized_and_mint_authority() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let (client, _, mint_authority, upgrade_authority) = setup(&env, eligible(&env, 1));
+        let next = Address::generate(&env);
+
+        env.set_auths(&[]);
+        assert!(client.try_set_upgrade_authority(&next).is_err());
+
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &mint_authority,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_upgrade_authority",
+                args: (next.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_set_upgrade_authority(&next).is_err());
+
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &upgrade_authority,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_upgrade_authority",
+                args: (mint_authority.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(
+            client
+                .try_set_upgrade_authority(&mint_authority)
+                .unwrap_err(),
+            Ok(Error::InvalidConfiguration)
+        );
+        assert_eq!(client.get_config().upgrade_authority, upgrade_authority);
+    }
+
+    #[test]
+    fn set_upgrade_authority_idempotent_same_authority_emits_no_event() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let (client, _, _, upgrade_authority) = setup(&env, eligible(&env, 1));
+        let _ = env.events().all();
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &upgrade_authority,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_upgrade_authority",
+                args: (upgrade_authority.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_upgrade_authority(&upgrade_authority);
+        assert!(env.events().all().events().is_empty());
+        assert_eq!(client.get_config().upgrade_authority, upgrade_authority);
+    }
+
+    #[test]
+    fn set_upgrade_authority_rotates_and_emits_event() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let (client, provider, mint_authority, upgrade_authority) = setup(&env, eligible(&env, 1));
+        let _ = env.events().all();
+        let next = Address::generate(&env);
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &upgrade_authority,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_upgrade_authority",
+                args: (next.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_upgrade_authority(&next);
+        let changed_at = env.ledger().timestamp();
+        let all_events = env.events().all();
+        let events = all_events.events();
+        assert_eq!(events.len(), 1);
+        let soroban_sdk::xdr::ContractEventBody::V0(body) = &events[0].body;
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = vec![
+            &env,
+            Symbol::new(&env, "authority").into_val(&env),
+            Symbol::new(&env, "upgrade_changed").into_val(&env),
+        ];
+        assert_eq!(body.topics, topics.into());
+        let data: soroban_sdk::Map<Symbol, soroban_sdk::Val> = soroban_sdk::map![
+            &env,
+            (
+                Symbol::new(&env, "previous_authority"),
+                upgrade_authority.into_val(&env)
+            ),
+            (
+                Symbol::new(&env, "new_authority"),
+                next.clone().into_val(&env)
+            ),
+            (Symbol::new(&env, "changed_at"), changed_at.into_val(&env))
+        ];
+        assert_eq!(body.data, data.into());
+        assert_eq!(
+            client.get_config(),
+            Config {
+                booking_contract: provider,
+                mint_authority,
+                upgrade_authority: next,
+            }
+        );
     }
 }

@@ -41,9 +41,30 @@ content, personal identifiers, dispute evidence or secrets are included.
 |---|---|---|
 | booking_contract | Address | Data |
 | mint_authority | Address | Data |
+| upgrade_authority | Address | Data |
 
 Emitted exactly once, from the constructor, when a new SBT instance is
-configured.
+configured. `mint_authority` and `upgrade_authority` must be distinct.
+
+### `ContractUpgraded` — topics `["contract", "upgraded"]`
+
+| Field | Type | Encoding |
+|---|---|---|
+| new_wasm_hash | BytesN of 32 | Data |
+| upgraded_at | u64 | Data |
+
+Emitted after a successful `upgrade` call authorized by `upgrade_authority`.
+
+### `UpgradeAuthorityChanged` — topics `["authority", "upgrade_changed"]`
+
+| Field | Type | Encoding |
+|---|---|---|
+| previous_authority | Address | Data |
+| new_authority | Address | Data |
+| changed_at | u64 | Data |
+
+Emitted when `set_upgrade_authority` successfully rotates to a different address.
+Idempotent same-authority calls succeed without emitting this event.
 
 ## Errors
 
@@ -65,6 +86,7 @@ numeric codes:
 | 11 | StorageInvariantViolation | Broken linked records, malformed state or missing initialized counter |
 | 12 | CredentialIdOverflow | Checked counter increment fails |
 | 13 | AlreadyInitialized | Defensive rejection of repeated initialization |
+| 14 | InvalidWasmHash | Upgrade rejected because the WASM hash is all zeros |
 
 Coverage by category (STELLO-35 acceptance criterion: "Errors cover
 initialization, authorization, invalid input, duplicate issuance and missing
