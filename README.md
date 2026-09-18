@@ -5,7 +5,8 @@ Issues one immutable credential per eligible booking, bound to the traveller rec
 by a trusted Booking Contract.
 
 Configuration is set **atomically at deploy** via `__constructor`. There is no
-post-deploy `initialize`, and **no on-chain `upgrade`**.
+post-deploy `initialize`. WASM upgrades are authorized only by a distinct
+`upgrade_authority` (never automatically by `mint_authority`).
 
 ## Identifiers
 
@@ -19,26 +20,30 @@ Provider `booking_ref` is **not** stored or indexed by SBT.
 
 ## Public interface
 
-Exactly six entrypoints (enforced by `scripts/check_sbt_interface.py`):
+Approved entrypoints (enforced by `scripts/check_sbt_interface.py`):
 
 | Function | Purpose |
 |----------|---------|
-| `__constructor(booking_contract, mint_authority)` | Atomic config; requires `mint_authority` auth |
+| `__constructor(booking_contract, mint_authority, upgrade_authority)` | Atomic config; requires mint + upgrade authority auth; rejects mint == upgrade |
 | `get_config` | Read config (RPC simulation; no auth / TTL bump) |
 | `mint_for_booking(booking_id)` | Issue or return existing credential; mint-authority auth |
 | `get_credential(credential_id)` | Read credential by id |
 | `get_credential_by_booking(booking_id)` | Read credential by booking |
 | `is_review_eligible(booking_id, traveller)` | Owner match check for review gating |
+| `upgrade(new_wasm_hash)` | Replace WASM; upgrade-authority auth; rejects all-zero hash |
+| `set_upgrade_authority(new_upgrade_authority)` | Rotate upgrade authority; current upgrade-authority auth |
+| `contract_version` | Compile-time package version string (read-only) |
 
-There is **no** transfer, transfer-from, approval, burn, revoke, owner setter, or upgrade API.
+There is **no** transfer, transfer-from, approval, burn, revoke, or owner-setter API.
 
 ## Roles
 
 | Actor | Actions |
 |-------|---------|
 | Mint authority | Authorize `__constructor` and every `mint_for_booking` |
+| Upgrade authority | Authorize `__constructor`, `upgrade`, and `set_upgrade_authority` |
 | Traveller | Credential **owner** after mint (no transfer / reassignment) |
-| Anyone (simulation) | `get_config`, `get_credential*`, `is_review_eligible` |
+| Anyone (simulation) | `get_config`, `get_credential*`, `is_review_eligible`, `contract_version` |
 
 ## Requirements
 
@@ -60,7 +65,8 @@ make check      # fmt + clippy + test + interface
 ## CI/CD & Testnet Deployment
 
 GitHub Actions automates checks and Testnet **first deploy**. **Mainnet is not automated.**
-SBT has **no upgrade path**; a second automatic deploy is refused once the registry is locked.
+After first deploy, lock the registry with `STELLO_TESTNET_CONTRACT_ID`. WASM updates
+use on-chain `upgrade()` under `upgrade_authority` (manual operational path; not this workflow).
 
 ### What runs on push / PR
 
@@ -70,7 +76,7 @@ On `pull_request` and pushes to `dev` / `main` (and on Testnet tags), the **CI**
 2. `cargo test`
 3. `cargo clippy --all-targets -- -D warnings`
 4. Optimized WASM build with provenance meta (`source_repo`, `commit_sha`)
-5. Interface check via `scripts/check_sbt_interface.py` (exactly six approved entrypoints)
+5. Interface check via `scripts/check_sbt_interface.py` (approved entrypoints only)
 6. Structured meta check + `sha256sum` == `stellar contract info hash --wasm`
 7. WASM artifact upload
 
@@ -81,11 +87,11 @@ A normal push to `dev` **never deploys**.
 From the commit you want deployed:
 
 ```bash
-git tag -a v0.1.0-testnet.X -m "SBT Testnet Release X"
-git push origin v0.1.0-testnet.X
+git tag -a v0.2.0-testnet.X -m "SBT Testnet Release X"
+git push origin v0.2.0-testnet.X
 ```
 
-Tag pattern required: `v*-testnet.*` (example: `v0.1.0-testnet.3`).
+Tag pattern required: `v*-testnet.*` (example: `v0.2.0-testnet.1`).
 
 ### What the Deploy Testnet workflow does
 
@@ -95,7 +101,7 @@ On `v*-testnet.*` tags, Environment **`dev`** drives **first deploy only**:
 |------------------------------|----------|
 | unset / empty | `DEPLOY` — new Contract ID with constructor args |
 | whitespace-only | **FAIL** |
-| set to a live ID | **FAIL** — refuses redeploy (no `upgrade()`; never create a second registry automatically) |
+| set to a live ID | **FAIL** — refuses automatic redeploy of a second registry (use `upgrade()` manually) |
 
 Gates:
 
@@ -105,7 +111,7 @@ Gates:
 4. Local interface + meta checks
 5. `sha256sum` == `stellar contract info hash --wasm`
 6. GitHub build provenance attestation (**soft** — continues if org plan lacks Artifact Attestations)
-7. Deploy with constructor args; envelope signed by **deployer**, constructor `mint_authority.require_auth()` signed via `--auth-mode non-root` + `--auto-sign`
+7. Deploy with constructor args; envelope signed by **deployer**, constructor `mint_authority.require_auth()` and `upgrade_authority.require_auth()` signed via `--auth-mode non-root` + `--auto-sign`
 8. On-chain verification (interface, `get_config`, three-way wasm hash)
 9. Artifacts + GitHub prerelease + Step Summary
 
@@ -133,6 +139,7 @@ For private repos on plans without Artifact Attestations, attestation is **skipp
 |------|----------|---------|
 | `BOOKING_CONTRACT` | yes | Trusted Booking Contract ID (`C…`) on Testnet |
 | `MINT_AUTHORITY` | yes | Address authorized to mint (`G…`) |
+| `UPGRADE_AUTHORITY` | yes | Address authorized to upgrade (`G…`); must differ from `MINT_AUTHORITY` |
 | `STELLO_TESTNET_CONTRACT_ID` | after first deploy | SBT Contract ID — set to **lock** registry and block auto-redeploy |
 
 **Secrets**
@@ -141,6 +148,7 @@ For private repos on plans without Artifact Attestations, attestation is **skipp
 |------|----------|---------|
 | `STELLAR_TESTNET_SECRET_KEY` | yes | Deployer / fee payer (`S…`) for first deploy |
 | `MINT_AUTHORITY_SECRET_KEY` | yes | Secret for `MINT_AUTHORITY` — must sign `__constructor` (`mint_authority.require_auth()`). Never printed. |
+| `UPGRADE_AUTHORITY_SECRET_KEY` | yes | Secret for `UPGRADE_AUTHORITY` — must sign `__constructor` (`upgrade_authority.require_auth()`). Never printed. |
 
 Notes:
 
@@ -152,12 +160,14 @@ Notes:
 
 ## Manual Deploy (testnet)
 
-Build first (`make build`). Constructor requires **mint authority** auth (non-root under create-contract):
+Build first (`make build`). Constructor requires **mint authority** and
+**upgrade authority** auth (non-root under create-contract):
 
 ```bash
 # Identities (examples)
 stellar keys generate deployer --network testnet --fund
 stellar keys generate mint-authority --network testnet --fund
+stellar keys generate upgrade-authority --network testnet --fund
 
 make build
 
@@ -169,10 +179,14 @@ stellar contract deploy \
   --network testnet \
   -- \
   --booking_contract <BOOKING_CONTRACT_ID> \
-  --mint_authority <MINT_AUTHORITY_G_ADDRESS>
+  --mint_authority <MINT_AUTHORITY_G_ADDRESS> \
+  --upgrade_authority <UPGRADE_AUTHORITY_G_ADDRESS>
 ```
 
-Ensure the CLI can sign as `mint-authority` (identity present / `--auto-sign`). Do **not** call a separate `initialize` — that entrypoint does not exist.
+Ensure the CLI can sign as `mint-authority` and `upgrade-authority` (identities
+present / `--auto-sign`). Do **not** call a separate `initialize` — that entrypoint
+does not exist. For Mainnet, prefer a multisig or timelock contract as
+`upgrade_authority`.
 
 Do not commit real production addresses or secret keys into docs or scripts.
 
