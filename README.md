@@ -29,7 +29,9 @@ Approved entrypoints (enforced by `scripts/check_sbt_interface.py`):
 | `mint_for_booking(booking_id)` | Issue or return existing credential; mint-authority auth |
 | `get_credential(credential_id)` | Read credential by id |
 | `get_credential_by_booking(booking_id)` | Read credential by booking |
-| `is_review_eligible(booking_id, traveller)` | Owner match check for review gating |
+| `is_review_eligible(booking_id, traveller)` | Owner match and not-yet-reviewed check for review gating |
+| `mark_reviewed(booking_id, review_hash)` | Persist review proof; credential-owner auth |
+| `get_review_status(booking_id)` | Read optional ReviewStatus |
 | `upgrade(new_wasm_hash)` | Replace WASM; upgrade-authority auth; rejects all-zero hash |
 | `set_upgrade_authority(new_upgrade_authority)` | Rotate upgrade authority; current upgrade-authority auth |
 | `contract_version` | Compile-time package version string (read-only) |
@@ -42,8 +44,8 @@ There is **no** transfer, transfer-from, approval, burn, revoke, or owner-setter
 |-------|---------|
 | Mint authority | Authorize `__constructor` and every `mint_for_booking` |
 | Upgrade authority | Authorize `__constructor`, `upgrade`, and `set_upgrade_authority` |
-| Traveller | Credential **owner** after mint (no transfer / reassignment) |
-| Anyone (simulation) | `get_config`, `get_credential*`, `is_review_eligible`, `contract_version` |
+| Traveller (credential owner) | Authorize `mark_reviewed`; credential remains permanent |
+| Anyone (simulation) | `get_config`, `get_credential*`, `is_review_eligible`, `get_review_status`, `contract_version` |
 
 ## Requirements
 

@@ -371,7 +371,7 @@ jobs:
           )"
           printf '%s\n' "${INTERFACE}"
 
-          for required in __constructor get_config mint_for_booking get_credential get_credential_by_booking is_review_eligible upgrade set_upgrade_authority contract_version; do
+          for required in __constructor get_config mint_for_booking get_credential get_credential_by_booking is_review_eligible mark_reviewed get_review_status upgrade set_upgrade_authority contract_version; do
             if ! printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${required}\\b|fn[[:space:]]+${required}\\("; then
               echo "::error::Required entrypoint missing on contract: ${required}"
               exit 1

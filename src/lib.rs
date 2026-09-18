@@ -28,6 +28,8 @@ pub enum Error {
     CredentialIdOverflow = 12,
     AlreadyInitialized = 13,
     InvalidWasmHash = 14,
+    ReviewAlreadySubmitted = 15,
+    InvalidReviewHash = 16,
 }
 
 #[contracttype]
@@ -55,6 +57,18 @@ pub struct Credential {
     pub schema_version: u32,
 }
 
+/// Immutable on-chain proof that a review was submitted for a booking.
+/// Absence of a record means the booking has not been reviewed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewStatus {
+    pub booking: BookingKey,
+    pub credential_id: u64,
+    pub reviewer: Address,
+    pub review_hash: BytesN<32>,
+    pub reviewed_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -62,6 +76,9 @@ pub enum DataKey {
     NextCredentialId,
     Credential(u64),
     Issuance(BookingKey),
+    /// Separate from Credential so existing persisted credentials stay readable
+    /// after WASM upgrade without migration.
+    ReviewStatus(BookingKey),
 }
 
 #[contractevent(topics = ["sbt", "minted"])]
@@ -93,6 +110,17 @@ pub struct UpgradeAuthorityChanged {
     pub previous_authority: Address,
     pub new_authority: Address,
     pub changed_at: u64,
+}
+
+#[contractevent(topics = ["review", "marked"])]
+pub struct ReviewMarked {
+    #[topic]
+    pub credential_id: u64,
+    pub booking_contract: Address,
+    pub booking_id: u64,
+    pub traveller: Address,
+    pub review_hash: BytesN<32>,
+    pub reviewed_at: u64,
 }
 
 #[contracttype]
@@ -264,7 +292,7 @@ impl StelloSbtEngine {
         Ok(())
     }
 
-    /// Compile-time package version string (e.g. `"0.2.0"`).
+    /// Compile-time package version string (e.g. `"0.3.0"`).
     /// **Read-only** — no auth, no storage, no TTL mutation.
     pub fn contract_version(env: Env) -> String {
         String::from_str(&env, env!("CARGO_PKG_VERSION"))
@@ -352,8 +380,83 @@ impl StelloSbtEngine {
         booking_id: u64,
         traveller: Address,
     ) -> Result<bool, Error> {
-        Ok(Self::get_credential_by_booking(env, booking_id)?
-            .is_some_and(|credential| credential.owner == traveller))
+        // Read-only: no auth, no TTL bump (same policy as get_credential*).
+        // No credential for booking_id → false (not an error).
+        let Some(credential) = Self::get_credential_by_booking(env.clone(), booking_id)? else {
+            return Ok(false);
+        };
+        if credential.owner != traveller {
+            return Ok(false);
+        }
+        let key = BookingKey {
+            booking_contract: credential.booking.booking_contract,
+            booking_id,
+        };
+        Ok(load_review_status(&env, &key)?.is_none())
+    }
+
+    /// Persist immutable on-chain proof that the credential owner submitted a review.
+    /// **Auth:** credential owner (traveller) only — not mint/upgrade authority.
+    ///
+    /// Review body lives off-chain (e.g. MongoDB). `review_hash` must be the
+    /// SHA-256 of a deterministic canonical JSON payload (schemaVersion, fixed
+    /// field order, UTF-8, normalized newlines; sort mediaHashes if unordered).
+    pub fn mark_reviewed(
+        env: Env,
+        booking_id: u64,
+        review_hash: BytesN<32>,
+    ) -> Result<ReviewStatus, Error> {
+        let config = load_config(&env)?;
+        let booking_key = BookingKey {
+            booking_contract: config.booking_contract.clone(),
+            booking_id,
+        };
+        let next_id = load_next_id(&env)?;
+        let Some(credential) = lookup_booking(&env, &config, &booking_key, next_id)? else {
+            return Err(Error::CredentialNotFound);
+        };
+        credential.owner.require_auth();
+        if review_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::InvalidReviewHash);
+        }
+        if let Some(existing) = load_review_status(&env, &booking_key)? {
+            if existing.review_hash == review_hash {
+                // Idempotent retry: keep reviewed_at, no duplicate event.
+                extend_persistent(&env, &DataKey::ReviewStatus(booking_key));
+                bump_instance_ttl(&env);
+                return Ok(existing);
+            }
+            return Err(Error::ReviewAlreadySubmitted);
+        }
+        let status = ReviewStatus {
+            booking: booking_key.clone(),
+            credential_id: credential.credential_id,
+            reviewer: credential.owner.clone(),
+            review_hash: review_hash.clone(),
+            reviewed_at: env.ledger().timestamp(),
+        };
+        store_review_status(&env, &status);
+        bump_instance_ttl(&env);
+        ReviewMarked {
+            credential_id: status.credential_id,
+            booking_contract: booking_key.booking_contract,
+            booking_id,
+            traveller: status.reviewer.clone(),
+            review_hash,
+            reviewed_at: status.reviewed_at,
+        }
+        .publish(&env);
+        Ok(status)
+    }
+
+    /// Read review-submission status for a booking. **Read-only** — no auth / TTL bump.
+    pub fn get_review_status(env: Env, booking_id: u64) -> Result<Option<ReviewStatus>, Error> {
+        let config = load_config(&env)?;
+        let key = BookingKey {
+            booking_contract: config.booking_contract,
+            booking_id,
+        };
+        load_review_status(&env, &key)
     }
 }
 
@@ -414,6 +517,26 @@ fn load_config(env: &Env) -> Result<Config, Error> {
         .instance()
         .get(&DataKey::Config)
         .ok_or(Error::NotInitialized)
+}
+
+fn load_review_status(env: &Env, booking_key: &BookingKey) -> Result<Option<ReviewStatus>, Error> {
+    let Some(status) = env
+        .storage()
+        .persistent()
+        .get::<_, ReviewStatus>(&DataKey::ReviewStatus(booking_key.clone()))
+    else {
+        return Ok(None);
+    };
+    if status.booking != *booking_key {
+        return Err(Error::StorageInvariantViolation);
+    }
+    Ok(Some(status))
+}
+
+fn store_review_status(env: &Env, status: &ReviewStatus) {
+    let key = DataKey::ReviewStatus(status.booking.clone());
+    env.storage().persistent().set(&key, status);
+    extend_persistent(env, &key);
 }
 
 fn valid_configuration(
@@ -1148,6 +1271,10 @@ mod tests {
             client.try_is_review_eligible(&1, &Address::generate(&env)),
             Err(Ok(Error::NotInitialized))
         );
+        assert_eq!(
+            client.try_get_review_status(&1),
+            Err(Ok(Error::NotInitialized))
+        );
     }
 
     #[test]
@@ -1424,7 +1551,7 @@ mod tests {
         env.set_auths(&[]);
         let v = client.contract_version();
         assert_eq!(v, String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        assert_eq!(v, String::from_str(&env, "0.2.0"));
+        assert_eq!(v, String::from_str(&env, "0.3.0"));
     }
 
     #[test]
@@ -1649,5 +1776,315 @@ mod tests {
                 upgrade_authority: next,
             }
         );
+    }
+
+    fn review_hash(env: &Env, fill: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[fill; 32])
+    }
+
+    #[test]
+    fn storage_compat_config_credential_and_upgrade_authority_unchanged_with_review_api() {
+        let env = test_env();
+        let (client, provider, mint_authority, upgrade_authority) = setup(&env, eligible(&env, 1));
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let credential = client.get_credential(&id);
+        let config = client.get_config();
+        assert_eq!(
+            config,
+            Config {
+                booking_contract: provider.clone(),
+                mint_authority,
+                upgrade_authority,
+            }
+        );
+        assert_eq!(credential.booking.booking_contract, provider);
+        assert_eq!(
+            client.get_credential_by_booking(&1),
+            Some(credential.clone())
+        );
+        // New review keys start empty; existing shapes remain readable.
+        assert_eq!(client.get_review_status(&1), None);
+        assert!(client.is_review_eligible(&1, &credential.owner));
+        assert_eq!(client.mock_all_auths().mint_for_booking(&1), id);
+        assert_eq!(client.get_credential(&id), credential);
+    }
+
+    #[test]
+    fn mark_reviewed_happy_path_emits_once_and_gates_eligibility() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let record = eligible(&env, 4);
+        let owner = record.traveller.clone();
+        let (client, provider, _, _) = setup(&env, record);
+        let id = client.mock_all_auths().mint_for_booking(&4);
+        assert_eq!(client.get_review_status(&4), None);
+        assert!(client.is_review_eligible(&4, &owner));
+        assert!(!client.is_review_eligible(&4, &Address::generate(&env)));
+
+        let hash = review_hash(&env, 0x11);
+        let _ = env.events().all();
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (4_u64, hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let status = client.mark_reviewed(&4, &hash);
+        let reviewed_at = env.ledger().timestamp();
+        assert_eq!(
+            status,
+            ReviewStatus {
+                booking: BookingKey {
+                    booking_contract: provider.clone(),
+                    booking_id: 4,
+                },
+                credential_id: id,
+                reviewer: owner.clone(),
+                review_hash: hash.clone(),
+                reviewed_at,
+            }
+        );
+        let all_events = env.events().all();
+        let events = all_events.events();
+        assert_eq!(events.len(), 1);
+        let soroban_sdk::xdr::ContractEventBody::V0(body) = &events[0].body;
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = vec![
+            &env,
+            Symbol::new(&env, "review").into_val(&env),
+            Symbol::new(&env, "marked").into_val(&env),
+            id.into_val(&env),
+        ];
+        assert_eq!(body.topics, topics.into());
+        assert_eq!(client.get_review_status(&4), Some(status));
+        assert!(!client.is_review_eligible(&4, &owner));
+        assert_eq!(client.get_credential(&id).owner, owner);
+        assert_eq!(
+            client.get_credential_by_booking(&4).unwrap().booking,
+            BookingKey {
+                booking_contract: provider,
+                booking_id: 4
+            }
+        );
+    }
+
+    #[test]
+    fn mark_reviewed_rejects_non_owner_mint_and_upgrade_authority() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let record = eligible(&env, 1);
+        let owner = record.traveller.clone();
+        let (client, _, mint_authority, upgrade_authority) = setup(&env, record);
+        client.mock_all_auths().mint_for_booking(&1);
+        let hash = review_hash(&env, 0x22);
+        let stranger = Address::generate(&env);
+        for signer in [&stranger, &mint_authority, &upgrade_authority] {
+            env.set_auths(&[]);
+            env.mock_auths(&[MockAuth {
+                address: signer,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "mark_reviewed",
+                    args: (1_u64, hash.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }]);
+            assert!(client.try_mark_reviewed(&1, &hash).is_err());
+        }
+        assert_eq!(client.get_review_status(&1), None);
+        assert!(client.is_review_eligible(&1, &owner));
+    }
+
+    #[test]
+    fn mark_reviewed_before_credential_and_zero_hash_fail() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let record = eligible(&env, 1);
+        let owner = record.traveller.clone();
+        let (client, _, _, _) = setup(&env, record);
+        let hash = review_hash(&env, 0x33);
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(
+            client.try_mark_reviewed(&1, &hash).unwrap_err(),
+            Ok(Error::CredentialNotFound)
+        );
+
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, zero.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(
+            client.try_mark_reviewed(&1, &zero).unwrap_err(),
+            Ok(Error::InvalidReviewHash)
+        );
+        assert_eq!(client.get_review_status(&1), None);
+        assert!(client.is_review_eligible(&1, &owner));
+        assert_eq!(client.get_credential(&id).owner, owner);
+    }
+
+    #[test]
+    fn mark_reviewed_same_hash_idempotent_different_hash_rejected() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let record = eligible(&env, 1);
+        let owner = record.traveller.clone();
+        let (client, _, _, _) = setup(&env, record);
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let hash_a = review_hash(&env, 0x44);
+        let hash_b = review_hash(&env, 0x55);
+
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, hash_a.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let first = client.mark_reviewed(&1, &hash_a);
+        let _ = env.events().all();
+
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, hash_a.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let retry = client.mark_reviewed(&1, &hash_a);
+        assert_eq!(retry, first);
+        assert_eq!(retry.reviewed_at, first.reviewed_at);
+        assert!(env.events().all().events().is_empty());
+        assert_eq!(client.get_review_status(&1), Some(first.clone()));
+
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, hash_b.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(
+            client.try_mark_reviewed(&1, &hash_b).unwrap_err(),
+            Ok(Error::ReviewAlreadySubmitted)
+        );
+        assert_eq!(client.get_review_status(&1), Some(first));
+        assert!(!client.is_review_eligible(&1, &owner));
+        assert_eq!(client.get_credential(&id).credential_id, id);
+    }
+
+    #[test]
+    fn mark_reviewed_extends_review_status_ttl() {
+        use soroban_sdk::testutils::{Ledger, MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let record = eligible(&env, 1);
+        let owner = record.traveller.clone();
+        let (client, provider, _, _) = setup(&env, record);
+        client.mock_all_auths().mint_for_booking(&1);
+        let hash = review_hash(&env, 0x66);
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.mark_reviewed(&1, &hash);
+        let key = DataKey::ReviewStatus(BookingKey {
+            booking_contract: provider,
+            booking_id: 1,
+        });
+        let ttl = env.as_contract(&client.address, || env.storage().persistent().get_ttl(&key));
+        assert_eq!(ttl, PERSISTENT_TTL_EXTEND_TO);
+
+        env.ledger()
+            .with_mut(|info| info.sequence_number += 450_001);
+        let before = env.as_contract(&client.address, || env.storage().persistent().get_ttl(&key));
+        assert!(before < PERSISTENT_TTL_THRESHOLD);
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.mark_reviewed(&1, &hash);
+        env.as_contract(&client.address, || {
+            assert_eq!(
+                env.storage().persistent().get_ttl(&key),
+                PERSISTENT_TTL_EXTEND_TO
+            );
+        });
+        // Reads still do not bump TTL.
+        env.ledger()
+            .with_mut(|info| info.sequence_number += 450_001);
+        let mid = env.as_contract(&client.address, || env.storage().persistent().get_ttl(&key));
+        let _ = client.get_review_status(&1);
+        let _ = client.is_review_eligible(&1, &owner);
+        env.as_contract(&client.address, || {
+            assert_eq!(env.storage().persistent().get_ttl(&key), mid);
+        });
+    }
+
+    #[test]
+    fn review_does_not_enable_transfer_burn_or_credential_mutation() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        let env = test_env();
+        let record = eligible(&env, 1);
+        let owner = record.traveller.clone();
+        let (client, _, _, _) = setup(&env, record);
+        let id = client.mock_all_auths().mint_for_booking(&1);
+        let hash = review_hash(&env, 0x77);
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mark_reviewed",
+                args: (1_u64, hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.mark_reviewed(&1, &hash);
+        let original = client.get_credential(&id);
+        env.mock_all_auths();
+        for name in ["transfer", "burn", "set_owner", "revoke"] {
+            let result = env.try_invoke_contract::<soroban_sdk::Val, Error>(
+                &client.address,
+                &Symbol::new(&env, name),
+                vec![&env, owner.clone().into_val(&env), id.into_val(&env)],
+            );
+            assert!(result.is_err(), "unexpected callable: {name}");
+        }
+        assert_eq!(client.get_credential(&id), original);
+        assert_eq!(client.get_review_status(&1).unwrap().review_hash, hash);
     }
 }

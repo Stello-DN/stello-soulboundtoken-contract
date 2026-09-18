@@ -12,17 +12,41 @@ separately via `upgrade_authority` and do not reassign credential owners.
 | `mint_for_booking(booking_id)` | Requires mint-authority authorization. New issuance derives the owner from the trusted Booking Contract's `traveller`. Retry returns the existing credential and never replaces its owner. |
 | `get_credential(credential_id)` | Reads a validated credential. |
 | `get_credential_by_booking(booking_id)` | Reads a validated credential using the configured Booking Contract and booking ID. |
-| `is_review_eligible(booking_id, traveller)` | Compares the supplied address with the stored owner; does not modify ownership or prove wallet control. |
+| `is_review_eligible(booking_id, traveller)` | Compares the supplied address with the stored owner and requires that no `ReviewStatus` exists yet; does not modify ownership or prove wallet control. |
+| `mark_reviewed(booking_id, review_hash)` | Requires credential-owner authorization. Persists immutable `ReviewStatus` under a separate storage key; idempotent for the same hash. |
+| `get_review_status(booking_id)` | Reads optional `ReviewStatus`; no auth / TTL bump. |
 | `upgrade(new_wasm_hash)` | Requires upgrade-authority authorization. Replaces contract WASM; does not mutate credential ownership. Rejects an all-zero hash. |
 | `set_upgrade_authority(new_upgrade_authority)` | Requires current upgrade-authority authorization. Rotates upgrade authority; rejects equality with mint authority. |
 | `contract_version()` | Read-only compile-time package version; no auth or storage writes. |
 
 The contract has no transfer, transfer-from, approval, operator, owner setter,
 burn, or revocation entrypoint. Neither the traveler nor the mint authority can
-reassign a credential. Mint authority cannot upgrade unless separately configured
-as upgrade authority (constructor rejects that configuration). Changing the
-provider's traveler after issuance cannot change the already stored owner through
-a mint retry. No transferable-token or NFT-wallet compatibility is promised.
+reassign a credential. Review submission does not burn or mutate the credential
+struct; status lives under `DataKey::ReviewStatus`. Mint authority cannot upgrade
+unless separately configured as upgrade authority (constructor rejects that
+configuration). Changing the provider's traveler after issuance cannot change the
+already stored owner through a mint retry. No transferable-token or NFT-wallet
+compatibility is promised.
+
+### Canonical review hash (off-chain)
+
+MongoDB stores the full review. Stellar stores only `SHA-256` of a deterministic
+canonical UTF-8 JSON payload, for example:
+
+```json
+{
+  "schemaVersion": 1,
+  "bookingId": 4,
+  "traveller": "G...",
+  "rating": 5,
+  "content": "Great local experience",
+  "mediaHashes": []
+}
+```
+
+Fixed field names and order (or equivalent canonical JSON), normalized newlines,
+preserve `schemaVersion`, sort `mediaHashes` when order is not meaningful, and
+never hash arbitrary non-canonical JSON. The digest must be exactly 32 bytes.
 
 Soroban storage is scoped to the executing contract. A different contract can
 write an identical key in its own storage, but cannot overwrite this SBT's
