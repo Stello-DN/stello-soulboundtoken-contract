@@ -1,18 +1,18 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    Address, BytesN, Env, IntoVal, String, Symbol, contract, contractimpl, contracttype, vec,
-    Event as _, testutils::Address as _, testutils::Events as _,
-    testutils::storage::Persistent as _,
+    Address, BytesN, Env, Event as _, IntoVal, String, Symbol, contract, contractimpl,
+    contracttype, testutils::Address as _, testutils::Events as _,
+    testutils::storage::Persistent as _, vec,
 };
 
+use crate::storage::{DataKey, load_config, load_next_id};
 use crate::{
     Booking, BookingKey, BookingState, CancelledBy, Config, Credential, Error,
     INSTANCE_TTL_EXTEND_TO, INSTANCE_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO,
     PERSISTENT_TTL_THRESHOLD, ProviderError, ReviewStatus, SbtInitialized, StelloSbtEngine,
     StelloSbtEngineClient, valid_configuration,
 };
-use crate::storage::{DataKey, load_config, load_next_id};
 
 fn test_env() -> Env {
     let mut env = Env::default();
@@ -1844,8 +1844,7 @@ fn getters_remain_read_only_and_do_not_bump_ttl() {
         keys.clone()
             .map(|key| env.storage().persistent().get_ttl(&key))
     });
-    let instance_before =
-        env.as_contract(&client.address, || env.storage().instance().get_ttl());
+    let instance_before = env.as_contract(&client.address, || env.storage().instance().get_ttl());
 
     let _ = client.get_config();
     let _ = client.contract_version();
