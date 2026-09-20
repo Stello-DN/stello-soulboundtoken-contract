@@ -10,7 +10,7 @@ Jira acceptance criteria below. No contract behavior changes.
 
 ## Shared fixtures
 
-All tests share one fixture set in `src/lib.rs` (`#[cfg(test)] mod tests`),
+All tests share one fixture set in `src/test.rs`,
 avoiding duplicated setup across functional tickets:
 
 | Fixture | Purpose |
