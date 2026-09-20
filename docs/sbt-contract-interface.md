@@ -15,6 +15,8 @@ separately via `upgrade_authority` and do not reassign credential owners.
 | `is_review_eligible(booking_id, traveller)` | Compares the supplied address with the stored owner and requires that no `ReviewStatus` exists yet; does not modify ownership or prove wallet control. |
 | `mark_reviewed(booking_id, review_hash)` | Requires credential-owner authorization. Persists immutable `ReviewStatus` under a separate storage key; idempotent for the same hash. |
 | `get_review_status(booking_id)` | Reads optional `ReviewStatus`; no auth / TTL bump. |
+| `extend_instance_ttl()` | Permissionless instance (+ WASM/code) TTL renewal; no business-data mutation. |
+| `extend_credential_ttl(booking_id)` | Permissionless renewal of Issuance + Credential (+ ReviewStatus if present) and instance TTL. |
 | `upgrade(new_wasm_hash)` | Requires upgrade-authority authorization. Replaces contract WASM; does not mutate credential ownership. Rejects an all-zero hash. |
 | `set_upgrade_authority(new_upgrade_authority)` | Requires current upgrade-authority authorization. Rotates upgrade authority; rejects equality with mint authority. |
 | `contract_version()` | Read-only compile-time package version; no auth or storage writes. |

@@ -32,6 +32,8 @@ Approved entrypoints (enforced by `scripts/check_sbt_interface.py`):
 | `is_review_eligible(booking_id, traveller)` | Owner match and not-yet-reviewed check for review gating |
 | `mark_reviewed(booking_id, review_hash)` | Persist review proof; credential-owner auth |
 | `get_review_status(booking_id)` | Read optional ReviewStatus |
+| `extend_instance_ttl` | Permissionless instance (+ code) TTL maintenance |
+| `extend_credential_ttl(booking_id)` | Permissionless credential entry TTL maintenance |
 | `upgrade(new_wasm_hash)` | Replace WASM; upgrade-authority auth; rejects all-zero hash |
 | `set_upgrade_authority(new_upgrade_authority)` | Rotate upgrade authority; current upgrade-authority auth |
 | `contract_version` | Compile-time package version string (read-only) |
@@ -45,13 +47,26 @@ There is **no** transfer, transfer-from, approval, burn, revoke, or owner-setter
 | Mint authority | Authorize `__constructor` and every `mint_for_booking` |
 | Upgrade authority | Authorize `__constructor`, `upgrade`, and `set_upgrade_authority` |
 | Traveller (credential owner) | Authorize `mark_reviewed`; credential remains permanent |
-| Anyone (simulation) | `get_config`, `get_credential*`, `is_review_eligible`, `get_review_status`, `contract_version` |
+| Anyone | `get_config`, `get_credential*`, `is_review_eligible`, `get_review_status`, `contract_version`, `extend_instance_ttl`, `extend_credential_ttl` |
 
 ## Requirements
 
 - Rust with `wasm32v1-none` (`rustup target add wasm32v1-none`)
 - [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`) — CI pins **28.0.0**
 - Soroban SDK 27.x
+
+## Source layout
+
+```
+src/
+├── lib.rs       # StelloSbtEngine entrypoints
+├── types.rs     # Config, Credential, ReviewStatus, ...
+├── errors.rs
+├── events.rs
+├── storage.rs   # DataKey, TTL, load/store helpers
+├── provider.rs  # Booking ABI mirror + fetch/validate
+└── test.rs
+```
 
 ## Commands
 
